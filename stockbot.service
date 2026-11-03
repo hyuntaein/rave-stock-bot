@@ -1,0 +1,15 @@
+[Unit]
+Description=Rave Stock Auto-Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/rave-stock-bot
+ExecStart=/home/ubuntu/rave-stock-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+Environment=TZ=Asia/Seoul
+
+[Install]
+WantedBy=multi-user.target
