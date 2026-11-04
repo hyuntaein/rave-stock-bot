@@ -73,6 +73,24 @@
   .foot{text-align:center;margin:18px 0}
   .foot a{color:var(--sub);font-size:13px}
   .hidden{display:none}
+  .st-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}
+  .st-title{font-weight:700;font-size:17px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:1px}
+  .dot.ok{background:var(--green)} .dot.warn{background:#f59f00} .dot.off{background:#adb5bd}
+  .srow{border-top:1px solid var(--line);padding:14px 0 4px}
+  .srow:first-of-type{border-top:0}
+  .sname{font-weight:700;font-size:16px}
+  .sprice{font-weight:700;font-size:16px}
+  .pill{display:inline-block;font-size:12px;font-weight:700;padding:4px 8px;border-radius:8px;background:#f2f4f6;color:#4e5968}
+  .pill.wait{background:#fff4e6;color:#d9480f} .pill.hold{background:var(--blue-weak);color:var(--blue)}
+  .pill.done{background:var(--green-weak);color:#067a4b} .pill.stop{background:var(--red-weak);color:var(--red)}
+  .kv{display:flex;justify-content:space-between;font-size:14px;color:#4e5968;margin-top:6px}
+  .kv b{color:var(--ink);font-weight:500}
+  .order{margin-top:10px;background:#fff4e6;border-radius:12px;padding:10px 12px;font-size:14px;line-height:1.6;color:#7a3e00}
+  .ev{display:flex;gap:10px;padding:10px 0;border-top:1px solid var(--line);font-size:14px;line-height:1.5}
+  .ev:first-child{border-top:0}
+  .ev time{flex:none;color:var(--sub);font-size:12px;width:64px;padding-top:2px}
+  .ev div{white-space:pre-line}
 </style>
 </head>
 <body>
@@ -105,7 +123,7 @@
           <li>왼쪽 맨 아래 <b>Developer settings</b> → <b>Personal access tokens</b> → <b>Fine-grained tokens</b></li>
           <li><b>Generate new token</b></li>
           <li>Token name: <code>stock-app</code>, Expiration: <b>1년(366 days)</b></li>
-          <li>Repository access: <b>Only select repositories</b> → <code>rave-stock-bot</code> 선택</li>
+          <li>Repository access: <b>Only select repositories</b> → <code>rave-stock-bot</code>, <code>rave-stock-data</code> 선택</li>
           <li>Permissions → Repository permissions → <b>Contents</b>를 <b>Read and write</b>로</li>
           <li>맨 아래 <b>Generate token</b> → 나온 값 복사해서 위 칸에 붙여넣기</li>
         </ol>
@@ -115,6 +133,21 @@
 
   <!-- 메인 -->
   <section id="main" class="hidden">
+    <!-- 현황 -->
+    <div class="card" id="statusCard">
+      <div class="st-head">
+        <div class="st-title">📊 지금 현황</div>
+        <a href="#" class="muted" id="stRefresh">새로고침</a>
+      </div>
+      <div class="muted" id="stMeta">불러오는 중…</div>
+      <div id="stRows" style="margin-top:8px"></div>
+    </div>
+    <div class="card" id="evCard">
+      <div class="st-title" style="margin-bottom:6px">🕘 최근 기록</div>
+      <div class="muted" style="margin-bottom:6px">주문 접수 · 체결 · 취소가 시간순으로 쌓여요. 대기 주문은 토스 앱 → 주문내역 → 대기에서 바로 취소할 수 있어요.</div>
+      <div id="evList"></div>
+    </div>
+
     <div class="card">
       <div class="row" style="margin-bottom:12px">
         <div style="font-weight:700;font-size:17px">매매 방식</div>
@@ -155,6 +188,7 @@
 <script>
 const OWNER = "hyuntaein", REPO = "rave-stock-bot", PATH = "config.yaml", BRANCH = "main";
 const API = `https://api.github.com/repos/${OWNER}/${REPO}/contents/${PATH}`;
+const STATUS_API = `https://api.github.com/repos/${OWNER}/rave-stock-data/contents/status.json`;
 const $ = (id) => document.getElementById(id);
 
 let token = null, sha = null, cfg = null, savedText = "";
@@ -208,6 +242,7 @@ async function load(){
   savedText = toYaml();
   render();
   show("main");
+  startStatus();
 }
 
 function normalize(){
@@ -397,6 +432,56 @@ async function save(){
   refreshSave();
 }
 
+/* ---------- 현황 ---------- */
+const esc = (t) => String(t ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const hm = (iso) => { const d = new Date(iso); return isNaN(d) ? "" : d.toLocaleString("ko-KR", {month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false}); };
+function ago(iso){ const s = (Date.now() - new Date(iso)) / 1000; if (s < 60) return "방금"; if (s < 3600) return Math.floor(s/60) + "분 전"; if (s < 86400) return Math.floor(s/3600) + "시간 전"; return Math.floor(s/86400) + "일 전"; }
+function kstMarketOpen(){
+  const k = new Date(Date.now() + (new Date().getTimezoneOffset() + 540) * 60000);
+  const m = k.getHours() * 60 + k.getMinutes(), d = k.getDay();
+  return d >= 1 && d <= 5 && m >= 540 && m < 920;
+}
+let stTimer = null;
+async function loadStatus(){
+  let r;
+  try {
+    r = await fetch(STATUS_API + "?_=" + Date.now(), { cache: "no-store",
+      headers: { "Authorization": `Bearer ${token}`, "Accept": "application/vnd.github+json" } });
+  } catch(e){ $("stMeta").textContent = "인터넷 연결을 확인해 주세요."; return; }
+  if (r.status === 404 || r.status === 403){
+    $("stMeta").innerHTML = "아직 현황 저장소가 연결되지 않았어요.<br>(비공개 저장소 <b>rave-stock-data</b>와 토큰 권한, 서버 연결이 필요해요)";
+    $("stRows").innerHTML = ""; $("evList").innerHTML = ""; return;
+  }
+  if (r.status !== 200){ $("stMeta").textContent = "현황을 불러오지 못했어요 (" + r.status + ")"; return; }
+  let st; try { st = JSON.parse(b64dec((await r.json()).content)); } catch(e){ $("stMeta").textContent = "현황 형식 오류"; return; }
+  const stale = (Date.now() - new Date(st.updated_at)) / 1000 > (kstMarketOpen() ? 180 : 900);
+  const dot = stale ? "warn" : (st.market_open ? "ok" : "off");
+  $("stMeta").innerHTML = `<span class="dot ${dot}"></span>${st.mode === "실전" ? "🔴 실전" : "🧪 모의"} · ${st.market_open ? "장중 감시 중" : "장 마감 — 대기 중"} · ${ago(st.updated_at)} 확인`
+    + (stale ? `<br><span style="color:#d9480f">⚠️ 봇 소식이 한동안 없어요. 서버가 꺼졌는지 확인이 필요할 수 있어요.</span>` : "");
+  $("stRows").innerHTML = (st.stocks || []).map(x => {
+    const cls = x.label.includes("대기 중") ? "wait" : x.label.includes("보유") ? "hold" : x.label.includes("완료") ? "done" : x.label.includes("정지") ? "stop" : "";
+    const pl = (x.held && x.avg && x.price) ? ((x.price / x.avg - 1) * 100) : null;
+    let h = `<div class="srow"><div class="row"><div><span class="sname">${esc(x.name)}</span> <span class="muted">${esc(x.symbol)}</span></div>
+      <div class="sprice">${x.price ? fmt(x.price) + "원" : "-"}</div></div>
+      <div style="margin-top:8px"><span class="pill ${cls}">${esc(x.label)}</span></div>
+      <div class="kv"><span>보유</span><b>${x.held ? x.held + "주 · 평균 " + fmt(x.avg) + "원" : "없음"}${pl !== null ? ` <span style="color:${pl >= 0 ? "var(--red)" : "var(--blue)"}">(${pl >= 0 ? "+" : ""}${pl.toFixed(1)}%)</span>` : ""}</b></div>`;
+    if (x.pnl) h += `<div class="kv"><span>실현 손익 (누적)</span><b style="color:${x.pnl >= 0 ? "var(--red)" : "var(--blue)"}">${x.pnl >= 0 ? "+" : ""}${fmt(x.pnl)}원</b></div>`;
+    if (x.order){
+      const o = x.order;
+      h += `<div class="order">⏳ <b>${o.side} 주문 ${o.canceling ? "취소 중" : "대기 중"}</b> · ${o.qty}주 · ${o.price ? fmt(o.price) + "원 " : ""}${o.type} (${esc(o.reason)})<br>
+        <span style="font-size:12px">${hm(o.placed_at)} 접수 · 취소하려면 토스 앱 → 주문내역 → 대기</span></div>`;
+    }
+    for (const n of x.notes || []) h += `<div class="muted" style="margin-top:8px">ℹ️ ${esc(n)}</div>`;
+    return h + "</div>";
+  }).join("") || `<div class="muted" style="margin-top:8px">켜져 있는 종목이 없어요.</div>`;
+  const evs = (st.events || []).slice().reverse();
+  const row = (e) => `<div class="ev"><time>${hm(e.t)}</time><div>${esc(e.text)}</div></div>`;
+  $("evList").innerHTML = !evs.length ? `<div class="muted">아직 기록이 없어요.</div>`
+    : evs.slice(0, 6).map(row).join("") + (evs.length > 6 ? `<details><summary class="muted" style="font-weight:500;font-size:14px;padding:10px 0">이전 기록 ${evs.length - 6}개 더 보기</summary>${evs.slice(6).map(row).join("")}</details>` : "");
+}
+function startStatus(){ loadStatus(); clearInterval(stTimer); stTimer = setInterval(() => { if (!document.hidden) loadStatus(); }, 30000); }
+document.addEventListener("visibilitychange", () => { if (!document.hidden && token && !$("main").classList.contains("hidden")) loadStatus(); });
+
 /* ---------- 이벤트 ---------- */
 $("tokenBtn").onclick = () => {
   const t = $("tokenIn").value.trim();
@@ -418,6 +503,7 @@ $("maxBudget").addEventListener("input", (ev) => {
   document.querySelectorAll("#stocks .card").forEach((c, i) => update(c, cfg.stocks[i]));
 });
 $("saveBtn").onclick = save;
+$("stRefresh").onclick = (e) => { e.preventDefault(); loadStatus(); };
 $("reloadLink").onclick = (e) => { e.preventDefault(); if (toYaml() !== savedText && !confirm("저장 안 한 변경이 사라져요. 새로고침할까요?")) return; clearToast(); load(); };
 $("logoutLink").onclick = (e) => { e.preventDefault(); if (confirm("이 기기에서 연결을 해제할까요? (봇은 계속 돌아가요)")) { setToken(null); show("setup"); } };
 window.addEventListener("beforeunload", (e) => { if (cfg && toYaml() !== savedText){ e.preventDefault(); e.returnValue = ""; } });

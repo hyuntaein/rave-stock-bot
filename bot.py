@@ -22,6 +22,7 @@ import csv
 import json
 import logging
 import os
+import base64
 import re
 import sys
 import threading
@@ -324,8 +325,24 @@ def _kakao_send_now(text):
             raise RuntimeError(f"카카오 전송 오류 {r.status_code}: {r.text[:300]}")
 
 
-def notify(text):
-    """카톡 알림 — 실패해도 매매는 계속 (별도 스레드에서 전송)"""
+EVENTS_FILE = BASE_DIR / "events.json"
+try:
+    EVENTS = json.loads(EVENTS_FILE.read_text(encoding="utf-8"))[-60:]
+except Exception:
+    EVENTS = []
+
+
+def notify(text, kakao=True):
+    """웹앱 '최근 기록'에 남기고, 카톡으로도 보냄 — 실패해도 매매는 계속"""
+    EVENTS.append({"t": datetime.now(KST).isoformat(timespec="seconds"), "text": text})
+    del EVENTS[:-60]
+    try:
+        EVENTS_FILE.write_text(json.dumps(EVENTS, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    if not kakao:
+        return
+
     def run():
         try:
             _kakao_send_now(text)
@@ -361,6 +378,75 @@ def kakao_setup():
         sys.exit(f"\n❌ 토큰은 받았지만 전송 실패: {e}\n   카카오 콘솔에서 '카카오톡 메시지 전송' 동의항목과 웹 도메인 등록을 확인해 주세요.")
 
 
+# ─────────────────────────── 웹앱 현황 (비공개 저장소에 status.json) ───────────────────────────
+GH_FILE = BASE_DIR / "github.json"
+
+
+class StatusPublisher:
+    """현황을 백그라운드에서 GitHub 비공개 저장소에 올림 — 실패해도 매매에는 영향 없음"""
+
+    def __init__(self):
+        self.pending, self.sha, self.lock = None, None, threading.Lock()
+        self.last_err = 0
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def submit(self, payload):
+        with self.lock:
+            self.pending = payload
+
+    def _loop(self):
+        while True:
+            time.sleep(3)
+            with self.lock:
+                payload, self.pending = self.pending, None
+            if payload is None or not GH_FILE.exists():
+                continue
+            try:
+                self._push(payload)
+            except Exception as e:
+                if time.time() - self.last_err > 600:
+                    log.warning(f"웹앱 현황 업로드 실패: {e}")
+                    self.last_err = time.time()
+
+    def _push(self, payload):
+        cfg = json.loads(GH_FILE.read_text(encoding="utf-8"))
+        url = f"https://api.github.com/repos/{cfg['repo']}/contents/status.json"
+        h = {"Authorization": f"Bearer {cfg['token']}", "Accept": "application/vnd.github+json"}
+        body = json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8")
+        for _ in range(2):
+            if self.sha is None:
+                r = requests.get(url, headers=h, timeout=10)
+                self.sha = r.json().get("sha") if r.status_code == 200 else None
+            data = {"message": "status", "content": base64.b64encode(body).decode()}
+            if self.sha:
+                data["sha"] = self.sha
+            r = requests.put(url, headers=h, json=data, timeout=15)
+            if r.status_code in (200, 201):
+                self.sha = r.json()["content"]["sha"]
+                return
+            if r.status_code in (409, 422):
+                self.sha = None
+                continue
+            raise RuntimeError(f"{r.status_code} {r.text[:200]}")
+
+
+def github_setup():
+    print("\n=== 웹앱 현황 연결 ===\n")
+    token = _clean_paste(input("1) GitHub 토큰(github_pat_...)을 붙여넣고 엔터: "))
+    repo = _clean_paste(input("2) 현황 저장소 이름 (그냥 엔터 = hyuntaein/rave-stock-data): ")) or "hyuntaein/rave-stock-data"
+    r = requests.get(f"https://api.github.com/repos/{repo}",
+                     headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}, timeout=10)
+    if r.status_code != 200:
+        sys.exit(f"\n❌ 저장소에 접근할 수 없어요 ({r.status_code}). 토큰에 {repo} 권한(Contents: Read and write)이 있는지 확인하세요.")
+    if not r.json().get("private"):
+        print("\n⚠️  이 저장소는 공개(Public)예요. 주문 내역이 누구에게나 보일 수 있어요.")
+    GH_FILE.write_text(json.dumps({"token": token, "repo": repo}), encoding="utf-8")
+    os.chmod(GH_FILE, 0o600)
+    p = StatusPublisher()
+    p._push({"updated_at": datetime.now(KST).isoformat(timespec="seconds"), "setup_test": True, "stocks": [], "events": EVENTS})
+    print("\n✅ 연결 완료! 1분 안에 웹앱 위쪽에 현황이 나타나요.")
+
+
 def record_trade(row):
     new = not TRADES_FILE.exists()
     with open(TRADES_FILE, "a", newline="", encoding="utf-8-sig") as f:
@@ -380,6 +466,9 @@ class Bot:
         self.state = load_state()
         self.closed_until = None
         self.last_notice = ""
+        self.publisher = StatusPublisher()
+        self.last_prices, self.last_pub, self.last_fp = {}, 0.0, None
+        self.started_at = datetime.now(KST).isoformat(timespec="seconds")
 
     @property
     def dry(self):
@@ -444,9 +533,11 @@ class Bot:
                 now = datetime.now(KST)
                 if not self.market_open(now):
                     self.notice_once("장 시간이 아니라 대기 중…")
+                    self.publish(now, market=False)
                     time.sleep(30)
                     continue
                 self.tick(now)
+                self.publish(now, market=True)
             except ApiError as e:
                 log.error(f"API 오류: {e}")
             except Exception:
@@ -480,6 +571,7 @@ class Bot:
             return
         self.notice_once(f"감시 중: {', '.join(s['name'] for s in active)}")
         prices = self.api.prices([s["symbol"] for s in active])
+        self.last_prices.update(prices)
         real = self.api.holdings() if any(s["sync"] for s in active) else {}
         for s in active:
             price = prices.get(s["symbol"])
@@ -495,6 +587,50 @@ class Bot:
             except ApiError as e:
                 self.handle_order_error(s, e)
             save_state(self.state)
+
+    def build_status(self, now, market):
+        rows = []
+        for s in self.stocks:
+            st = self.state.get(s["symbol"]) or new_stock_state()
+            held, oo = st.get("held_qty", 0), st.get("open_order")
+            if st.get("paused"):
+                label = "일시정지"
+            elif st.get("done"):
+                label = "매매 완료"
+            elif oo:
+                label = "주문 대기 중"
+            elif held > 0:
+                label = "보유 중 · 매도 대기"
+            else:
+                label = "매수 대기"
+            notes = []
+            if st.get("manual_buy_stop"):
+                notes.append("앱에서 매수 취소 → 매수 멈춤")
+            if st.get("no_take_profit"):
+                notes.append("앱에서 매도 취소 → 익절 멈춤 (손절은 감시 중)")
+            rows.append({
+                "symbol": s["symbol"], "name": s["name"], "price": self.last_prices.get(s["symbol"]),
+                "held": held, "avg": int(st["buy_amount"] / held) if held else None,
+                "label": label, "notes": notes, "pnl": st.get("realized_pnl", 0),
+                "order": None if not oo else {
+                    "side": "매수" if oo["side"] == "BUY" else "매도", "qty": oo["qty"], "price": oo["price"],
+                    "type": "시장가" if oo["type"] == "MARKET" else "지정가", "reason": oo["reason"],
+                    "placed_at": oo["placed_at"], "canceling": oo.get("cancel_requested", False)},
+            })
+        return {"updated_at": now.isoformat(timespec="seconds"), "market_open": market,
+                "mode": "모의" if self.dry else "실전", "started_at": self.started_at,
+                "stocks": rows, "events": EVENTS[-30:]}
+
+    def publish(self, now, market):
+        if not GH_FILE.exists():
+            return          # 현황 저장소 연결 전 — 연결되면 바로 올라감
+        payload = self.build_status(now, market)
+        fp = json.dumps([payload["mode"], payload["market_open"], payload["events"][-1:],
+                         [{k: v for k, v in r.items() if k != "price"} for r in payload["stocks"]]], ensure_ascii=False)
+        wait = 60 if market else 600
+        if fp != self.last_fp or time.time() - self.last_pub >= wait:
+            self.last_fp, self.last_pub = fp, time.time()
+            self.publisher.submit(payload)
 
     def handle_order_error(self, s, e):
         st = self.state[s["symbol"]]
@@ -573,10 +709,10 @@ class Bot:
             oid = self.api.place_order(s["symbol"], side, qty, otype, price)
         st["open_order"] = {"id": oid, "side": side, "type": otype, "qty": qty, "price": price,
                             "reason": reason, "placed_at": now.isoformat(), "cancel_requested": False}
-        if not self.dry:
-            how = "시장가" if otype == "MARKET" else f"{won(price)} 지정가"
-            notify(f"📝 [{s['name']}] {'매수' if side == 'BUY' else '매도'} 주문 접수 ({reason})\n"
-                   f"{qty}주 · {how}\n취소하려면 토스 앱 → 주문내역 → 대기에서 취소하세요.")
+        how = "시장가" if otype == "MARKET" else f"{won(price)} 지정가"
+        notify(f"📝 [{s['name']}] {'매수' if side == 'BUY' else '매도'} 주문 접수 ({reason})\n"
+               f"{qty}주 · {how}" + ("" if self.dry else "\n취소하려면 토스 앱 → 주문내역 → 대기에서 취소하세요."),
+               kakao=not self.dry)
 
     def cancel_orphan_orders(self):
         """웹앱에서 끄거나 지운 종목에 걸려 있던 주문 취소"""
@@ -655,6 +791,7 @@ class Bot:
                 why = "가격이 매도 구간을 벗어남"
         if why:
             log.info(f"[{s['name']}] 주문 취소 요청 ({why})")
+            notify(f"↩️ [{s['name']}] 봇이 주문 취소 요청 ({why})", kakao=False)
             try:
                 self.api.cancel_order(o["id"])
             except ApiError as e:
@@ -665,6 +802,10 @@ class Bot:
     def apply_fill(self, s, st, o, status, filled, avg):
         if filled <= 0:
             log.info(f"[{s['name']}] 주문 종료({status}) — 체결 없음")
+            if status == "CANCELED" and o.get("cancel_requested"):
+                notify(f"↩️ [{s['name']}] 주문 취소 완료 — 체결 없음", kakao=False)
+            elif status == "REJECTED":
+                notify(f"⛔ [{s['name']}] 주문 거부됨", kakao=False)
             return
         amount = filled * avg
         if self.dry:   # 모의 체결분은 실제 계좌에 없으므로 따로 기억
@@ -679,9 +820,8 @@ class Bot:
             if st["held_qty"] >= s["target_qty"]:
                 st["buy_complete"] = True
             log.info(f"[{s['name']}] ✔ 매수 체결 {filled}주 @ {won(avg)} (보유 {st['held_qty']}주)")
-            if not self.dry:
-                notify(f"🛒 [{s['name']}] 매수 체결\n{filled}주 × {won(avg)} = {won(amount)}\n"
-                       f"보유 {st['held_qty']}주")
+            notify(f"🛒 [{s['name']}] 매수 체결\n{filled}주 × {won(avg)} = {won(amount)}\n"
+                   f"보유 {st['held_qty']}주", kakao=not self.dry)
         else:
             held_before = st["held_qty"]
             avg_buy = st["buy_amount"] / held_before if held_before else avg
@@ -690,10 +830,9 @@ class Bot:
             st["held_qty"] -= filled
             st["buy_amount"] = int(avg_buy * st["held_qty"])
             log.info(f"[{s['name']}] ✔ 매도 체결({o['reason']}) {filled}주 @ {won(avg)} — 손익 {pnl:+,}원 (남은 {st['held_qty']}주)")
-            if not self.dry:
-                icon = "🔻" if o["reason"] == "손절" else "🎯"
-                notify(f"{icon} [{s['name']}] {o['reason']} 매도 체결\n{filled}주 × {won(avg)} = {won(amount)}\n"
-                       f"손익 약 {pnl:+,}원 (수수료·세금 제외)\n남은 수량 {st['held_qty']}주")
+            icon = "🔻" if o["reason"] == "손절" else "🎯"
+            notify(f"{icon} [{s['name']}] {o['reason']} 매도 체결\n{filled}주 × {won(avg)} = {won(amount)}\n"
+                   f"손익 약 {pnl:+,}원 (수수료·세금 제외)\n남은 수량 {st['held_qty']}주", kakao=not self.dry)
         record_trade([datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"), s["name"], s["symbol"],
                       "매수" if o["side"] == "BUY" else "매도", o["reason"], filled, avg, amount,
                       "모의" if self.dry else "실전"])
@@ -702,6 +841,9 @@ class Bot:
 # ─────────────────────────── 실행 ───────────────────────────
 def main():
     args = sys.argv[1:]
+    if args[:1] == ["--github"]:
+        github_setup()
+        return
     if args[:1] == ["--kakao"]:
         kakao_setup()
         return
