@@ -17,8 +17,8 @@ stocks:
     symbol: "005930"           # 종목코드 6자리
     enabled: true              # false = 이 종목은 쉼
     budget: 250000            # 이 종목에 쓸 금액
-    buy_min: 209999            # 매수 범위 시작
-    buy_max: 211000            # 매수 범위 끝
+    buy_min: 209000            # 매수 범위 시작
+    buy_max: 209500            # 매수 범위 끝
     sell_min: 230000           # 이 가격 이상이면 전량 매도
     stop_loss: 190000          # 이 가격 이하면 전량 손절
     account_sync: true         # true = 토스 계좌 실제 수량을 따라감
