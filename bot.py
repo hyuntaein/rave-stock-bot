@@ -22,7 +22,9 @@ import csv
 import json
 import logging
 import os
+import re
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -270,6 +272,95 @@ def new_stock_state():
             "sim_offset": 0}
 
 
+# ─────────────────────────── 카카오톡 알림 (나에게 보내기) ───────────────────────────
+KAKAO_FILE = BASE_DIR / "kakao.json"
+WEBAPP_URL = "https://hyuntaein.github.io/rave-stock-bot/"
+_kakao_lock = threading.Lock()
+
+
+def _clean_paste(v: str) -> str:
+    """터미널 붙여넣기 때 섞여 들어오는 ^[[200~ 같은 표시 제거"""
+    v = re.sub(r"\x1b\[20[01]~|\^\[\[20[01]~", "", v or "")
+    return v.strip().strip("~").strip()
+
+
+def _kakao_token_request(cfg, data):
+    data = dict(data, client_id=cfg["rest_key"])
+    if cfg.get("client_secret"):
+        data["client_secret"] = cfg["client_secret"]
+    r = requests.post("https://kauth.kakao.com/oauth/token", data=data, timeout=10)
+    if r.status_code != 200:
+        raise RuntimeError(f"카카오 토큰 오류 {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def _kakao_save(cfg, tok):
+    cfg["access_token"] = tok["access_token"]
+    cfg["access_exp"] = time.time() + int(tok.get("expires_in", 21599))
+    if tok.get("refresh_token"):      # 만료 1달 전부터 새 refresh_token이 같이 옴
+        cfg["refresh_token"] = tok["refresh_token"]
+        cfg["refresh_exp"] = time.time() + int(tok.get("refresh_token_expires_in", 5184000))
+    tmp = KAKAO_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(KAKAO_FILE)
+
+
+def _kakao_send_now(text):
+    with _kakao_lock:
+        if not KAKAO_FILE.exists():
+            return
+        cfg = json.loads(KAKAO_FILE.read_text(encoding="utf-8"))
+        if time.time() > cfg.get("access_exp", 0) - 600:
+            _kakao_save(cfg, _kakao_token_request(cfg, {"grant_type": "refresh_token",
+                                                        "refresh_token": cfg["refresh_token"]}))
+        tpl = {"object_type": "text", "text": text[:200],
+               "link": {"web_url": WEBAPP_URL, "mobile_web_url": WEBAPP_URL},
+               "button_title": "설정 열기"}
+        r = requests.post("https://kapi.kakao.com/v2/api/talk/memo/default/send",
+                          headers={"Authorization": f"Bearer {cfg['access_token']}"},
+                          data={"template_object": json.dumps(tpl, ensure_ascii=False)}, timeout=10)
+        if r.status_code != 200:
+            raise RuntimeError(f"카카오 전송 오류 {r.status_code}: {r.text[:300]}")
+
+
+def notify(text):
+    """카톡 알림 — 실패해도 매매는 계속 (별도 스레드에서 전송)"""
+    def run():
+        try:
+            _kakao_send_now(text)
+        except Exception as e:
+            log.warning(f"카톡 알림 실패: {e}")
+    threading.Thread(target=run, daemon=True).start()
+
+
+def kakao_setup():
+    print("\n=== 카카오톡 알림 연결 ===\n")
+    rest = _clean_paste(input("1) REST API 키를 붙여넣고 엔터: "))
+    secret = _clean_paste(input("2) Client Secret 코드 (없으면 그냥 엔터): "))
+    url = ("https://kauth.kakao.com/oauth/authorize?response_type=code&scope=talk_message"
+           f"&client_id={rest}&redirect_uri={requests.utils.quote(WEBAPP_URL, safe='')}")
+    print("\n3) 아래 주소를 복사해서 PC 브라우저 주소창에 붙여넣고 카카오 로그인/동의를 하세요:\n")
+    print(url + "\n")
+    print("   로그인하면 웹앱 화면에 '카카오 인증 코드'가 나옵니다. 그 코드를 복사하세요.\n")
+    code = _clean_paste(input("4) 인증 코드를 붙여넣고 엔터: "))
+    m = re.search(r"code=([^&\s]+)", code)
+    if m:
+        code = m.group(1)
+    cfg = {"rest_key": rest, "client_secret": secret}
+    try:
+        tok = _kakao_token_request(cfg, {"grant_type": "authorization_code",
+                                         "redirect_uri": WEBAPP_URL, "code": code})
+    except Exception as e:
+        sys.exit(f"\n❌ 연결 실패: {e}\n   (코드는 한 번만 쓸 수 있어요. 3)부터 다시 해주세요)")
+    _kakao_save(cfg, tok)
+    try:
+        _kakao_send_now("✅ 레이브 자동매매 카톡 알림이 연결됐어요.\n앞으로 사고팔 때마다 여기로 알려드릴게요.")
+        print("\n✅ 연결 완료! 카카오톡 '나와의 채팅'을 확인해 보세요.")
+    except Exception as e:
+        sys.exit(f"\n❌ 토큰은 받았지만 전송 실패: {e}\n   카카오 콘솔에서 '카카오톡 메시지 전송' 동의항목과 웹 도메인 등록을 확인해 주세요.")
+
+
 def record_trade(row):
     new = not TRADES_FILE.exists()
     with open(TRADES_FILE, "a", newline="", encoding="utf-8-sig") as f:
@@ -313,8 +404,10 @@ class Bot:
                         self.state[sym] = new_stock_state()
                 save_state(self.state)
                 log.warning("🔴 실전 모드로 전환 — 모의 매매 기록을 초기화했습니다")
+                notify("🔴 실전 모드로 전환됐어요.\n이제 조건이 맞으면 실제 주문이 나갑니다.")
             elif not was_dry and self.dry:
                 log.info("🧪 모의 모드로 전환")
+                notify("🧪 모의 모드로 전환됐어요. 실제 주문은 나가지 않아요.")
 
     def notice_once(self, msg):
         if msg != self.last_notice:
@@ -332,6 +425,10 @@ class Bot:
     def run(self):
         mode = "🧪 모의 모드 (실제 주문 안 나감)" if self.dry else "🔴 실전 모드 (실제 주문)"
         log.info(f"봇 시작 — {mode}")
+        if not self.dry:
+            notify("▶️ 자동매매 봇이 시작됐어요 (실전 모드).\n" +
+                   "\n".join(f"· {s['name']} {won(s['buy_min'])}~{won(s['buy_max'])} 매수 / "
+                             f"{won(s['sell_min'])}↑ 매도 / {won(s['stop_loss'])}↓ 손절" for s in self.stocks))
         self.api.account_seq()
         for s in self.stocks:
             log.info(f"  {s['name']}({s['symbol']}) 예산 {won(s['budget'])} → 목표 {s['target_qty']}주 | "
@@ -368,9 +465,16 @@ class Bot:
                 elif st["paused"]:
                     st["paused"], st["reject_count"] = False, 0
                     log.info(f"[{s['name']}] ⚙️  조건 변경 → 일시정지 해제")
+                if st.get("manual_buy_stop") and not st["done"]:
+                    st["manual_buy_stop"], st["buy_complete"] = False, False
+                    log.info(f"[{s['name']}] ⚙️  조건 변경 → 매수 재개")
+                if st.get("no_take_profit"):
+                    st["no_take_profit"] = False
+                    log.info(f"[{s['name']}] ⚙️  조건 변경 → 익절 매도 재개")
             st["cfg_sig"] = sig
             if not st["done"] and not st["paused"]:
                 active.append(s)
+        self.cancel_orphan_orders()
         if not active:
             self.notice_once("진행 중인 종목이 없습니다 (모두 완료 또는 일시정지)")
             return
@@ -404,6 +508,8 @@ class Bot:
             st["paused"] = True
             log.error(f"[{s['name']}] 연속 실패로 이 종목을 일시정지했습니다. "
                       f"원인 확인 후 --reset 하거나 상태를 점검하세요.")
+            notify(f"⚠️ [{s['name']}] 주문이 3번 연속 실패해서 일시정지했어요.\n"
+                   f"사유: {e.code or e}\n웹앱에서 숫자를 고치면 다시 시작해요.")
 
     def sync_holding(self, s, st, real, now):
         """실제 계좌 수량을 봇 장부에 반영 (핸드폰으로 사고판 것 포함)"""
@@ -436,7 +542,7 @@ class Bot:
 
         held = st["held_qty"]
         stop_hit = held > 0 and price <= s["stop_loss"]
-        take_hit = held > 0 and price >= s["sell_min"]
+        take_hit = held > 0 and price >= s["sell_min"] and not st.get("no_take_profit")
         if stop_hit or take_hit:
             st["buy_complete"] = True
             qty = self.sell_qty(s, st)
@@ -467,6 +573,33 @@ class Bot:
             oid = self.api.place_order(s["symbol"], side, qty, otype, price)
         st["open_order"] = {"id": oid, "side": side, "type": otype, "qty": qty, "price": price,
                             "reason": reason, "placed_at": now.isoformat(), "cancel_requested": False}
+        if not self.dry:
+            how = "시장가" if otype == "MARKET" else f"{won(price)} 지정가"
+            notify(f"📝 [{s['name']}] {'매수' if side == 'BUY' else '매도'} 주문 접수 ({reason})\n"
+                   f"{qty}주 · {how}\n취소하려면 토스 앱 → 주문내역 → 대기에서 취소하세요.")
+
+    def cancel_orphan_orders(self):
+        """웹앱에서 끄거나 지운 종목에 걸려 있던 주문 취소"""
+        on = {s["symbol"] for s in self.stocks}
+        changed = False
+        for sym, st in self.state.items():
+            oo = st.get("open_order")
+            if not oo or sym in on:
+                continue
+            if not self.dry and not str(oo["id"]).startswith("SIM-"):
+                try:
+                    self.api.cancel_order(oo["id"])
+                except ApiError as e:
+                    if e.code not in ALREADY_DONE_CODES:
+                        log.error(f"[{sym}] 꺼진 종목 주문 취소 실패: {e}")
+                        continue
+                notify(f"🛑 [{sym}] 종목을 꺼서 걸려 있던 주문을 취소했어요.")
+            log.info(f"[{sym}] 종목이 꺼져서 대기 주문을 취소했습니다")
+            st["open_order"] = None
+            st["last_fill_at"] = datetime.now(KST).isoformat()
+            changed = True
+        if changed:
+            save_state(self.state)
 
     def check_open_order(self, s, st, price, now):
         o = st["open_order"]
@@ -494,6 +627,18 @@ class Bot:
                 self.handle_order_error(s, ApiError(0, "REJECTED", "거래소/증권사에서 주문 거부"))
             elif filled > 0:
                 st["reject_count"] = 0
+            if status == "CANCELED" and not o["cancel_requested"]:
+                # 봇이 취소한 게 아니라 사장님이 토스 앱에서 직접 취소함 → 같은 주문 반복 금지
+                if o["side"] == "BUY":
+                    st["buy_complete"], st["manual_buy_stop"] = True, True
+                    log.info(f"[{s['name']}] 📱 앱에서 매수 주문 취소 확인 → 매수 중단")
+                    notify(f"📱 [{s['name']}] 앱에서 매수 주문을 취소한 걸 확인했어요.\n"
+                           f"더 이상 사지 않아요. 다시 사려면 웹앱에서 숫자를 바꾸거나 '같은 조건으로 다시 매매'를 누르세요.")
+                elif o["reason"] != "손절":
+                    st["no_take_profit"] = True
+                    log.info(f"[{s['name']}] 📱 앱에서 매도 주문 취소 확인 → 익절 매도 중단 (손절은 계속 감시)")
+                    notify(f"📱 [{s['name']}] 앱에서 매도 주문을 취소한 걸 확인했어요.\n"
+                           f"익절 매도는 멈추고, 손절가는 계속 지켜볼게요.")
             return
 
         # 아직 미체결 — 취소가 필요한지 판단
@@ -534,6 +679,9 @@ class Bot:
             if st["held_qty"] >= s["target_qty"]:
                 st["buy_complete"] = True
             log.info(f"[{s['name']}] ✔ 매수 체결 {filled}주 @ {won(avg)} (보유 {st['held_qty']}주)")
+            if not self.dry:
+                notify(f"🛒 [{s['name']}] 매수 체결\n{filled}주 × {won(avg)} = {won(amount)}\n"
+                       f"보유 {st['held_qty']}주")
         else:
             held_before = st["held_qty"]
             avg_buy = st["buy_amount"] / held_before if held_before else avg
@@ -542,6 +690,10 @@ class Bot:
             st["held_qty"] -= filled
             st["buy_amount"] = int(avg_buy * st["held_qty"])
             log.info(f"[{s['name']}] ✔ 매도 체결({o['reason']}) {filled}주 @ {won(avg)} — 손익 {pnl:+,}원 (남은 {st['held_qty']}주)")
+            if not self.dry:
+                icon = "🔻" if o["reason"] == "손절" else "🎯"
+                notify(f"{icon} [{s['name']}] {o['reason']} 매도 체결\n{filled}주 × {won(avg)} = {won(amount)}\n"
+                       f"손익 약 {pnl:+,}원 (수수료·세금 제외)\n남은 수량 {st['held_qty']}주")
         record_trade([datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"), s["name"], s["symbol"],
                       "매수" if o["side"] == "BUY" else "매도", o["reason"], filled, avg, amount,
                       "모의" if self.dry else "실전"])
@@ -550,6 +702,13 @@ class Bot:
 # ─────────────────────────── 실행 ───────────────────────────
 def main():
     args = sys.argv[1:]
+    if args[:1] == ["--kakao"]:
+        kakao_setup()
+        return
+    if args[:1] == ["--kakao-test"]:
+        _kakao_send_now("🔔 테스트 알림입니다. 카톡 연결이 잘 되어 있어요.")
+        print("보냈습니다. 카카오톡 '나와의 채팅'을 확인하세요.")
+        return
     if args[:1] == ["--status"]:
         state = load_state()
         if not state:

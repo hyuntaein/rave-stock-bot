@@ -80,6 +80,14 @@
   <h1>레이브 자동매매</h1>
   <p class="lead" id="lead">종목과 가격 범위를 정하면, 1분 안에 봇에 반영돼요.</p>
 
+  <!-- 카카오 인증 코드 (카톡 연결할 때만 나타남) -->
+  <section id="kakao" class="card hidden" style="border:2px solid #fee500">
+    <div style="font-weight:700;font-size:17px">💬 카카오 인증 코드</div>
+    <p class="muted" style="line-height:1.6;margin:8px 0 12px">아래 코드를 복사해서 서버 창의 <b>"4) 인증 코드"</b> 칸에 붙여넣으세요. 코드는 한 번만 쓸 수 있어요.</p>
+    <div id="kakaoCode" style="word-break:break-all;background:#f9fafb;border-radius:12px;padding:12px 14px;font-family:monospace;font-size:14px"></div>
+    <button class="btn primary full" style="margin-top:12px" id="kakaoCopy">코드 복사</button>
+  </section>
+
   <!-- 처음 연결 -->
   <section id="setup" class="hidden">
     <div class="card">
@@ -287,6 +295,7 @@ function render(){
         <input type="text" data-k="name" placeholder="종목 이름 (예: 삼성전자)" style="flex:1">
         <label class="switch" title="켜기/끄기"><input type="checkbox" data-k="enabled"><span></span></label>
       </div>
+      <div class="muted" style="margin-top:8px;line-height:1.5">오른쪽 스위치를 끄고 저장하면 이 종목 매매를 멈추고, 걸려 있던 주문도 취소해요.</div>
       <label class="f">종목코드 6자리</label>
       <input type="text" inputmode="numeric" maxlength="6" data-k="symbol" placeholder="005930">
       <label class="f">이 종목에 쓸 금액</label>
@@ -412,6 +421,17 @@ $("saveBtn").onclick = save;
 $("reloadLink").onclick = (e) => { e.preventDefault(); if (toYaml() !== savedText && !confirm("저장 안 한 변경이 사라져요. 새로고침할까요?")) return; clearToast(); load(); };
 $("logoutLink").onclick = (e) => { e.preventDefault(); if (confirm("이 기기에서 연결을 해제할까요? (봇은 계속 돌아가요)")) { setToken(null); show("setup"); } };
 window.addEventListener("beforeunload", (e) => { if (cfg && toYaml() !== savedText){ e.preventDefault(); e.returnValue = ""; } });
+
+/* 카카오 로그인 후 돌아왔을 때: 인증 코드 보여주기 */
+const kcode = new URLSearchParams(location.search).get("code");
+if (kcode){
+  $("kakao").classList.remove("hidden");
+  $("kakaoCode").textContent = kcode;
+  $("kakaoCopy").onclick = async () => {
+    try { await navigator.clipboard.writeText(kcode); $("kakaoCopy").textContent = "✅ 복사됐어요"; }
+    catch(e){ const r = document.createRange(); r.selectNodeContents($("kakaoCode")); const s = getSelection(); s.removeAllRanges(); s.addRange(r); $("kakaoCopy").textContent = "선택됐어요 — Ctrl+C로 복사하세요"; }
+  };
+}
 
 token = getToken();
 if (token) load(); else show("setup");
