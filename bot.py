@@ -36,7 +36,7 @@ import yaml
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+load_dotenv(BASE_DIR / ".env", override=True)
 
 BASE_URL = os.environ.get("TOSS_BASE_URL", "https://openapi.tossinvest.com")
 KST = ZoneInfo("Asia/Seoul")
@@ -222,6 +222,7 @@ def load_config():
                 "sell_min": int(s["sell_min"]),
                 "stop_loss": int(s["stop_loss"]),
                 "sync": bool(s.get("account_sync", True)),
+                "round": int(s.get("round", 0) or 0),
             }
         except (KeyError, ValueError, TypeError) as e:
             errors.append(f"{name}: 값이 빠졌거나 숫자가 아님 ({e})")
@@ -284,6 +285,7 @@ class Bot:
         self.api = Toss()
         self.settings, self.stocks = load_config()
         self.cfg_mtime = CONFIG_FILE.stat().st_mtime
+        self.code_mtime = Path(__file__).stat().st_mtime
         self.state = load_state()
         self.closed_until = None
         self.last_notice = ""
@@ -296,11 +298,23 @@ class Bot:
         m = CONFIG_FILE.stat().st_mtime
         if m != self.cfg_mtime:
             self.cfg_mtime = m
+            was_dry = self.dry
             try:
                 self.settings, self.stocks = load_config()
                 log.info("⚙️  config.yaml 변경 감지 → 새 설정 적용")
             except Exception as e:
                 log.error(f"새 설정을 적용하지 못했습니다 (이전 설정 유지): {e}")
+                return
+            if was_dry and not self.dry:
+                # 모의로 사고판 기록이 실전에 섞이지 않게 초기화
+                for sym, st in list(self.state.items()):
+                    oo = st.get("open_order")
+                    if not oo or str(oo.get("id", "")).startswith("SIM-"):
+                        self.state[sym] = new_stock_state()
+                save_state(self.state)
+                log.warning("🔴 실전 모드로 전환 — 모의 매매 기록을 초기화했습니다")
+            elif not was_dry and self.dry:
+                log.info("🧪 모의 모드로 전환")
 
     def notice_once(self, msg):
         if msg != self.last_notice:
@@ -325,6 +339,10 @@ class Bot:
                      f"매도 {won(s['sell_min'])} 이상 | 손절 {won(s['stop_loss'])} 이하")
         while True:
             try:
+                if Path(__file__).stat().st_mtime != self.code_mtime:
+                    log.info("♻️  봇 프로그램이 업데이트되어 다시 시작합니다")
+                    save_state(self.state)
+                    sys.exit(0)   # systemd가 10초 뒤 새 코드로 자동 재시작
                 self.reload_config_if_changed()
                 now = datetime.now(KST)
                 if not self.market_open(now):
@@ -342,6 +360,15 @@ class Bot:
         active = []
         for s in self.stocks:
             st = self.state.setdefault(s["symbol"], new_stock_state())
+            sig = [s["budget"], s["buy_min"], s["buy_max"], s["sell_min"], s["stop_loss"], s["round"]]
+            if st.get("cfg_sig") is not None and st["cfg_sig"] != sig:
+                if st["done"] and st["held_qty"] == 0 and not st["open_order"]:
+                    self.state[s["symbol"]] = st = new_stock_state()
+                    log.info(f"[{s['name']}] ⚙️  조건 변경 → 새로 시작")
+                elif st["paused"]:
+                    st["paused"], st["reject_count"] = False, 0
+                    log.info(f"[{s['name']}] ⚙️  조건 변경 → 일시정지 해제")
+            st["cfg_sig"] = sig
             if not st["done"] and not st["paused"]:
                 active.append(s)
         if not active:
