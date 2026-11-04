@@ -2,21 +2,20 @@
 """
 레이브 주식 자동매매 봇 — 토스증권 Open API (국내주식)
 
-동작 규칙 (종목마다 config.yaml 에서 설정)
-  1) 현재가가 [매수 하한 ~ 매수 상한] 안에 들어오면 → 예산만큼 지정가 매수
-  2) 보유 중 현재가가 [매도 하한] 이상이 되면 → 전량 지정가 매도 (익절)
-  3) 보유 중 현재가가 [손절가] 이하로 떨어지면 → 전량 시장가 매도 (손절)
-  4) 매도가 끝나면 그 종목은 '완료' — 다시 돌리려면  python bot.py --reset 종목코드
-
-계좌 연동 (account_sync: true)
-  매번 실제 토스 계좌의 보유 수량을 읽어 판단합니다.
-  핸드폰으로 사고판 수량도 반영 → 매도·손절은 '계좌에 있는 그 종목 전체',
-  매수는 '예산 목표 수량 - 이미 가진 수량'만큼만.
+구조
+  · 주문 카드 (config.yaml 의 stocks)  : "이 가격대에서 이만큼 산다"
+      현재가가 [매수 범위] 안에 오면 예산만큼 지정가 매수
+      금액/매수 범위를 바꾸거나 '같은 조건으로 다시 매매'를 누르면 새 주문으로 인식
+  · 보유 묶음 (봇이 산 주식)            : 체결될 때마다 묶음이 생기고, 묶음마다 매도가·손절가를 따로 가짐
+      [매도가] 이상 → 묶음 전량 지정가 매도 / [손절가] 이하 → 묶음 전량 시장가 매도
+      웹앱 '조건 해제'(config.yaml 의 released_lots) → 봇이 더 이상 팔지 않음 (주식은 계좌에 그대로)
+  · 봇이 사지 않은 주식(원래 갖고 있던 주식)은 절대 건드리지 않음
 
 사용법
-  python bot.py            봇 실행
-  python bot.py --status   현재 종목별 상태 보기
-  python bot.py --reset 005930   해당 종목 상태 초기화 (처음부터 다시)
+  python bot.py              봇 실행
+  python bot.py --status     주문/묶음 상태 보기
+  python bot.py --kakao      카카오톡 알림 연결
+  python bot.py --github     웹앱 현황 연결
 """
 import csv
 import json
@@ -212,19 +211,19 @@ def load_config():
     st = cfg.get("settings", {})
     max_budget = int(st.get("max_budget_per_stock", 10_000_000))
     stocks, errors = [], []
-    for i, s in enumerate(cfg.get("stocks") or [], 1):
-        name = s.get("name") or f"{i}번 종목"
+    for i, s in enumerate(cfg.get("stocks") or []):
+        name = s.get("name") or f"{i + 1}번 종목"
         if not s.get("enabled", True):
             continue
         try:
             item = {
+                "id": str(s.get("id") or f"{str(s['symbol']).zfill(6)}#{i}"),
                 "name": name,
                 "symbol": str(s["symbol"]).zfill(6),
                 "budget": int(s["budget"]),
                 "buy_min": int(s["buy_min"]), "buy_max": int(s["buy_max"]),
                 "sell_min": int(s["sell_min"]),
                 "stop_loss": int(s["stop_loss"]),
-                "sync": bool(s.get("account_sync", True)),
                 "round": int(s.get("round", 0) or 0),
             }
         except (KeyError, ValueError, TypeError) as e:
@@ -250,6 +249,7 @@ def load_config():
         "order_timeout": int(st.get("order_timeout_sec", 60)),
         "start": st.get("trade_start", "09:00"),
         "end": st.get("trade_end", "15:19"),
+        "released": {str(x) for x in (cfg.get("released_lots") or [])},
     }
     return settings, stocks
 
@@ -265,12 +265,6 @@ def save_state(state):
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(STATE_FILE)
-
-
-def new_stock_state():
-    return {"held_qty": 0, "buy_amount": 0, "buy_complete": False, "done": False,
-            "paused": False, "reject_count": 0, "open_order": None, "realized_pnl": 0,
-            "sim_offset": 0}
 
 
 # ─────────────────────────── 카카오톡 알림 (나에게 보내기) ───────────────────────────
@@ -457,46 +451,108 @@ def record_trade(row):
 
 
 # ─────────────────────────── 봇 ───────────────────────────
+def new_ticket(run=1):
+    return {"done": False, "paused": False, "reject_count": 0, "open_order": None, "bought": 0,
+            "run": run, "cfg_sig": None, "manual_buy_stop": False}
+
+
 class Bot:
     def __init__(self):
         self.api = Toss()
         self.settings, self.stocks = load_config()
         self.cfg_mtime = CONFIG_FILE.stat().st_mtime
         self.code_mtime = Path(__file__).stat().st_mtime
-        self.state = load_state()
+        raw = load_state()
+        self.state = raw if raw.get("version") == 2 else self.migrate(raw)
         self.closed_until = None
         self.last_notice = ""
+        self.recent_fill = {}            # 종목별 마지막 체결 시각 (계좌 반영 지연 대비)
         self.publisher = StatusPublisher()
         self.last_prices, self.last_pub, self.last_fp = {}, 0.0, None
         self.started_at = datetime.now(KST).isoformat(timespec="seconds")
+        seed_events_from_trades()
+        save_state(self.state)
 
     @property
     def dry(self):
         return self.settings["dry_run"]
 
+    @property
+    def tickets(self):
+        return self.state["tickets"]
+
+    @property
+    def lots(self):
+        return self.state["lots"]
+
+    # ---------- 예전 상태 파일(종목 단위) → 주문/묶음 구조로 옮기기 ----------
+    def migrate(self, old):
+        new = {"version": 2, "tickets": {}, "lots": {}, "pnl": 0}
+        if not old:
+            return new
+        log.info("📦 예전 상태 파일을 주문/보유 묶음 구조로 옮깁니다")
+        for sym, st in old.items():
+            if not isinstance(st, dict):
+                continue
+            card = next((s for s in self.stocks if s["symbol"] == sym), None)
+            tid = card["id"] if card else f"{sym}#old"
+            held = int(st.get("held_qty", 0)) - int(st.get("sim_offset", 0))
+            oo = st.get("open_order")
+            if oo and str(oo.get("id", "")).startswith("SIM-"):
+                oo = None
+            t = new_ticket()
+            if st.get("done") and held <= 0:
+                t["done"] = True
+                if card:
+                    t["cfg_sig"] = self.sig(card)
+            if oo and oo.get("side") == "BUY":
+                t["open_order"] = oo
+            new["tickets"][tid] = t
+            if held > 0:
+                total = int(st.get("held_qty", 0)) or held
+                avg = int(st.get("buy_amount", 0) / total) if total else 0
+                lid = f"{tid}@0"
+                new["lots"][lid] = {
+                    "id": lid, "symbol": sym, "name": card["name"] if card else sym, "ticket": tid, "run": 0,
+                    "qty": held, "cost": avg * held,
+                    "sell_min": card["sell_min"] if card else None, "stop_loss": card["stop_loss"] if card else None,
+                    "opened_at": st.get("last_fill_at") or datetime.now(KST).isoformat(timespec="seconds"),
+                    "open_order": oo if (oo and oo.get("side") == "SELL") else None,
+                    "no_take_profit": bool(st.get("no_take_profit")), "reject_count": 0, "sim": False, "pnl": 0,
+                }
+                log.info(f"  [{sym}] 보유 {held}주 → 보유 묶음 {lid} (매도 {card and won(card['sell_min'])} / 손절 {card and won(card['stop_loss'])})")
+        return new
+
+    @staticmethod
+    def sig(s):
+        return [s["budget"], s["buy_min"], s["buy_max"], s["round"]]
+
     def reload_config_if_changed(self):
         m = CONFIG_FILE.stat().st_mtime
-        if m != self.cfg_mtime:
-            self.cfg_mtime = m
-            was_dry = self.dry
-            try:
-                self.settings, self.stocks = load_config()
-                log.info("⚙️  config.yaml 변경 감지 → 새 설정 적용")
-            except Exception as e:
-                log.error(f"새 설정을 적용하지 못했습니다 (이전 설정 유지): {e}")
-                return
-            if was_dry and not self.dry:
-                # 모의로 사고판 기록이 실전에 섞이지 않게 초기화
-                for sym, st in list(self.state.items()):
-                    oo = st.get("open_order")
-                    if not oo or str(oo.get("id", "")).startswith("SIM-"):
-                        self.state[sym] = new_stock_state()
-                save_state(self.state)
-                log.warning("🔴 실전 모드로 전환 — 모의 매매 기록을 초기화했습니다")
-                notify("🔴 실전 모드로 전환됐어요.\n이제 조건이 맞으면 실제 주문이 나갑니다.")
-            elif not was_dry and self.dry:
-                log.info("🧪 모의 모드로 전환")
-                notify("🧪 모의 모드로 전환됐어요. 실제 주문은 나가지 않아요.")
+        if m == self.cfg_mtime:
+            return
+        self.cfg_mtime = m
+        was_dry = self.dry
+        try:
+            self.settings, self.stocks = load_config()
+            log.info("⚙️  config.yaml 변경 감지 → 새 설정 적용")
+        except Exception as e:
+            log.error(f"새 설정을 적용하지 못했습니다 (이전 설정 유지): {e}")
+            return
+        if was_dry and not self.dry:
+            # 모의로 사고판 기록이 실전에 섞이지 않게 정리
+            for lid in [k for k, l in self.lots.items() if l.get("sim")]:
+                del self.lots[lid]
+            for tid, t in list(self.tickets.items()):
+                oo = t.get("open_order")
+                if not oo or str(oo.get("id", "")).startswith("SIM-"):
+                    self.tickets[tid] = new_ticket(t.get("run", 1) + 1)
+            save_state(self.state)
+            log.warning("🔴 실전 모드로 전환 — 모의 매매 기록을 정리했습니다")
+            notify("🔴 실전 모드로 전환됐어요.\n이제 조건이 맞으면 실제 주문이 나갑니다.")
+        elif not was_dry and self.dry:
+            log.info("🧪 모의 모드로 전환")
+            notify("🧪 모의 모드로 전환됐어요. 실제 주문은 나가지 않아요.")
 
     def notice_once(self, msg):
         if msg != self.last_notice:
@@ -515,14 +571,12 @@ class Bot:
         mode = "🧪 모의 모드 (실제 주문 안 나감)" if self.dry else "🔴 실전 모드 (실제 주문)"
         log.info(f"봇 시작 — {mode}")
         if not self.dry:
-            notify("▶️ 자동매매 봇이 시작됐어요 (실전 모드).\n" +
-                   "\n".join(f"· {s['name']} {won(s['buy_min'])}~{won(s['buy_max'])} 매수 / "
-                             f"{won(s['sell_min'])}↑ 매도 / {won(s['stop_loss'])}↓ 손절" for s in self.stocks))
+            lines = [f"· 주문 {s['name']} {won(s['buy_min'])}~{won(s['buy_max'])} 매수" for s in self.stocks
+                     if not self.tickets.get(s["id"], {}).get("done")]
+            lines += [f"· 보유 {l['name']} {l['qty']}주 / {won(l['sell_min'])}↑ 매도 / {won(l['stop_loss'])}↓ 손절"
+                      for l in self.lots.values()]
+            notify("▶️ 자동매매 봇이 시작됐어요 (실전 모드).\n" + "\n".join(lines))
         self.api.account_seq()
-        for s in self.stocks:
-            log.info(f"  {s['name']}({s['symbol']}) 예산 {won(s['budget'])} → 목표 {s['target_qty']}주 | "
-                     f"매수 {won(s['buy_min'])}~{won(s['buy_max'])} | "
-                     f"매도 {won(s['sell_min'])} 이상 | 손절 {won(s['stop_loss'])} 이하")
         while True:
             try:
                 if Path(__file__).stat().st_mtime != self.code_mtime:
@@ -533,6 +587,7 @@ class Bot:
                 now = datetime.now(KST)
                 if not self.market_open(now):
                     self.notice_once("장 시간이 아니라 대기 중…")
+                    self.housekeeping(now)
                     self.publish(now, market=False)
                     time.sleep(30)
                     continue
@@ -544,298 +599,436 @@ class Bot:
                 log.exception("예상치 못한 오류 (계속 실행)")
             time.sleep(self.settings["interval"])
 
-    def tick(self, now):
-        active = []
-        for s in self.stocks:
-            st = self.state.setdefault(s["symbol"], new_stock_state())
-            sig = [s["budget"], s["buy_min"], s["buy_max"], s["sell_min"], s["stop_loss"], s["round"]]
-            if st.get("cfg_sig") is not None and st["cfg_sig"] != sig:
-                if st["done"] and st["held_qty"] == 0 and not st["open_order"]:
-                    self.state[s["symbol"]] = st = new_stock_state()
-                    log.info(f"[{s['name']}] ⚙️  조건 변경 → 새로 시작")
-                elif st["paused"]:
-                    st["paused"], st["reject_count"] = False, 0
-                    log.info(f"[{s['name']}] ⚙️  조건 변경 → 일시정지 해제")
-                if st.get("manual_buy_stop") and not st["done"]:
-                    st["manual_buy_stop"], st["buy_complete"] = False, False
-                    log.info(f"[{s['name']}] ⚙️  조건 변경 → 매수 재개")
-                if st.get("no_take_profit"):
-                    st["no_take_profit"] = False
-                    log.info(f"[{s['name']}] ⚙️  조건 변경 → 익절 매도 재개")
-            st["cfg_sig"] = sig
-            if not st["done"] and not st["paused"]:
-                active.append(s)
-        self.cancel_orphan_orders()
-        if not active:
-            self.notice_once("진행 중인 종목이 없습니다 (모두 완료 또는 일시정지)")
-            return
-        self.notice_once(f"감시 중: {', '.join(s['name'] for s in active)}")
-        prices = self.api.prices([s["symbol"] for s in active])
-        self.last_prices.update(prices)
-        real = self.api.holdings() if any(s["sync"] for s in active) else {}
-        for s in active:
-            price = prices.get(s["symbol"])
-            if not price:
-                continue
-            st = self.state[s["symbol"]]
-            for k, v in new_stock_state().items():   # 예전 상태 파일 호환
-                st.setdefault(k, v)
-            if s["sync"]:
-                self.sync_holding(s, st, real.get(s["symbol"], (0, 0)), now)
-            try:
-                self.step(s, st, price, now)
-            except ApiError as e:
-                self.handle_order_error(s, e)
+    # ---------- 매 주기 ----------
+    def housekeeping(self, now):
+        """설정 변경 반영 · 꺼진 주문 취소 · 조건 해제 (장 시간 밖에서도 처리)"""
+        changed = self.sync_tickets()
+        changed |= self.cancel_orphan_buys()
+        changed |= self.handle_releases()
+        if changed:
             save_state(self.state)
 
-    def build_status(self, now, market):
-        rows = []
+    def tick(self, now):
+        self.housekeeping(now)
+        active = [s for s in self.stocks
+                  if not self.tickets[s["id"]]["done"] and not self.tickets[s["id"]]["paused"]]
+        lots = list(self.lots.values())
+        symbols = sorted({s["symbol"] for s in active} | {l["symbol"] for l in lots})
+        if not symbols:
+            self.notice_once("진행 중인 주문과 보유 묶음이 없습니다")
+            return
+        self.notice_once(f"감시 중: 주문 {len(active)}개 · 보유 묶음 {len(lots)}개")
+        prices = self.api.prices(symbols)
+        self.last_prices.update(prices)
+        if not self.dry and any(not l.get("sim") for l in lots):
+            self.reconcile(self.api.holdings(), now)
+        for s in active:
+            price = prices.get(s["symbol"])
+            if price:
+                try:
+                    self.step_ticket(s, self.tickets[s["id"]], price, now)
+                except ApiError as e:
+                    self.ticket_error(s, self.tickets[s["id"]], e)
+        for lot in list(self.lots.values()):
+            price = prices.get(lot["symbol"])
+            if price:
+                try:
+                    self.step_lot(lot, price, now)
+                except ApiError as e:
+                    self.lot_error(lot, e)
+        save_state(self.state)
+
+    def sync_tickets(self):
+        changed = False
         for s in self.stocks:
-            st = self.state.get(s["symbol"]) or new_stock_state()
-            held, oo = st.get("held_qty", 0), st.get("open_order")
-            if st.get("paused"):
+            t = self.tickets.setdefault(s["id"], new_ticket())
+            sig = self.sig(s)
+            if t["cfg_sig"] is not None and t["cfg_sig"] != sig:
+                if t["done"] and not t["open_order"]:
+                    self.tickets[s["id"]] = t = new_ticket(t["run"] + 1)
+                    log.info(f"[{s['name']}] ⚙️  조건 변경 → 새 주문으로 인식")
+                    notify(f"🆕 [{s['name']}] 새 매수 주문으로 등록했어요.\n"
+                           f"{won(s['buy_min'])}~{won(s['buy_max'])}에 오면 {s['target_qty']}주를 사서 새 묶음으로 관리해요.",
+                           kakao=False)
+                else:
+                    if t["paused"]:
+                        t["paused"], t["reject_count"] = False, 0
+                        log.info(f"[{s['name']}] ⚙️  조건 변경 → 일시정지 해제")
+                    if t.get("manual_buy_stop"):
+                        t["manual_buy_stop"] = False
+                changed = True
+            t["cfg_sig"] = sig
+            # 이번 회차에 산 묶음은 카드의 매도가·손절가를 따라감 (예전 묶음은 그대로)
+            for lot in self.lots.values():
+                if lot["ticket"] == s["id"] and lot.get("run") == t["run"]:
+                    if (lot["sell_min"], lot["stop_loss"], lot["name"]) != (s["sell_min"], s["stop_loss"], s["name"]):
+                        lot["sell_min"], lot["stop_loss"], lot["name"] = s["sell_min"], s["stop_loss"], s["name"]
+                        lot["no_take_profit"] = False
+                        changed = True
+        return changed
+
+    def cancel_orphan_buys(self):
+        """웹앱에서 끄거나 지운 주문 카드에 걸려 있던 매수 주문 취소"""
+        on = {s["id"] for s in self.stocks}
+        changed = False
+        for tid, t in self.tickets.items():
+            oo = t.get("open_order")
+            if not oo or tid in on:
+                continue
+            if not str(oo["id"]).startswith("SIM-"):
+                try:
+                    self.api.cancel_order(oo["id"])
+                    info = self.api.get_order(oo["id"])
+                    filled = to_int((info.get("execution") or {}).get("filledQuantity"))
+                    if filled:
+                        log.warning(f"[{oo.get('symbol', tid)}] 취소 전 {filled}주가 이미 체결됐어요 (보유 묶음으로 추가하지 않음)")
+                except ApiError as e:
+                    if e.code not in ALREADY_DONE_CODES:
+                        log.error(f"[{tid}] 꺼진 주문 취소 실패: {e}")
+                        continue
+            notify(f"🛑 [{oo.get('name', tid)}] 주문 카드를 꺼서 걸려 있던 매수 주문을 취소했어요.", kakao=not self.dry)
+            t["open_order"] = None
+            changed = True
+        return changed
+
+    def handle_releases(self):
+        changed = False
+        for lid in list(self.lots):
+            if lid not in self.settings["released"]:
+                continue
+            lot = self.lots[lid]
+            oo = lot.get("open_order")
+            if oo and not str(oo["id"]).startswith("SIM-"):
+                try:
+                    self.api.cancel_order(oo["id"])
+                except ApiError as e:
+                    if e.code not in ALREADY_DONE_CODES:
+                        log.error(f"[{lot['name']}] 조건 해제 중 매도 주문 취소 실패 (다음에 다시 시도): {e}")
+                        continue
+            del self.lots[lid]
+            log.info(f"[{lot['name']}] 🔓 보유 묶음 {lot['qty']}주 조건 해제")
+            notify(f"🔓 [{lot['name']}] 보유 묶음 {lot['qty']}주의 매도·손절 조건을 해제했어요.\n"
+                   f"봇은 더 이상 이 묶음을 팔지 않아요. 주식은 계좌에 그대로 있어요.", kakao=not self.dry)
+            changed = True
+        return changed
+
+    def reconcile(self, real, now):
+        """계좌 수량이 봇 기록보다 적으면 (앱에서 판 경우) 묶음 수량을 맞춤"""
+        by_sym = {}
+        for l in self.lots.values():
+            if not l.get("sim"):
+                by_sym.setdefault(l["symbol"], []).append(l)
+        for sym, lots in by_sym.items():
+            if any(l.get("open_order") for l in lots):
+                continue
+            if time.time() - self.recent_fill.get(sym, 0) < 60:
+                continue
+            have = real.get(sym, (0, 0))[0]
+            total = sum(l["qty"] for l in lots)
+            deficit = total - have
+            if deficit <= 0:
+                continue
+            for l in sorted(lots, key=lambda x: x["opened_at"], reverse=True):
+                if deficit <= 0:
+                    break
+                cut = min(l["qty"], deficit)
+                avgc = l["cost"] / l["qty"] if l["qty"] else 0
+                l["qty"] -= cut
+                l["cost"] = int(avgc * l["qty"])
+                deficit -= cut
+                if l["qty"] == 0:
+                    del self.lots[l["id"]]
+                    msg = f"📱 [{l['name']}] 계좌에 이 묶음 주식이 없어서 조건을 해제했어요 (앱에서 판 것으로 보여요)."
+                else:
+                    msg = f"📱 [{l['name']}] 계좌 수량이 {cut}주 적어서 묶음을 {l['qty']}주로 맞췄어요 (앱에서 판 것으로 보여요)."
+                log.info(msg)
+                notify(msg)
+
+    # ---------- 매수 (주문 카드) ----------
+    def step_ticket(self, s, t, price, now):
+        if t["open_order"]:
+            self.check_buy(s, t, price, now)
+            return
+        remain = s["target_qty"] - t["bought"]
+        if remain <= 0:
+            t["done"] = True
+            return
+        if s["buy_min"] <= price <= s["buy_max"]:
+            log.info(f"[{s['name']}] 🛒 매수 구간 진입 — 현재가 {won(price)} → {remain}주 {won(s['buy_price'])} 이하 지정가 매수")
+            oid = "SIM-" + uuid.uuid4().hex[:12] if self.dry else \
+                self.api.place_order(s["symbol"], "BUY", remain, "LIMIT", s["buy_price"])
+            t["open_order"] = {"id": oid, "side": "BUY", "type": "LIMIT", "qty": remain, "price": s["buy_price"],
+                               "reason": "구간매수", "placed_at": now.isoformat(), "cancel_requested": False,
+                               "symbol": s["symbol"], "name": s["name"]}
+            notify(f"📝 [{s['name']}] 매수 주문 접수\n{remain}주 · {won(s['buy_price'])} 지정가"
+                   + ("" if self.dry else "\n취소하려면 토스 앱 → 주문내역 → 대기에서 취소하세요."), kakao=not self.dry)
+
+    def fetch(self, o, price):
+        if self.dry or str(o["id"]).startswith("SIM-"):
+            if o["type"] == "MARKET":
+                px = price
+            elif o["side"] == "BUY":
+                if price > o["price"]:
+                    return "PENDING", 0, 0
+                px = price
+            else:
+                if price < o["price"]:
+                    return "PENDING", 0, 0
+                px = price
+            return "FILLED", o["qty"], px
+        info = self.api.get_order(o["id"])
+        ex = info.get("execution") or {}
+        return info.get("status"), to_int(ex.get("filledQuantity")), \
+            to_int(ex.get("averageFilledPrice")) or (o["price"] or price)
+
+    def check_buy(self, s, t, price, now):
+        o = t["open_order"]
+        status, filled, avg = self.fetch(o, price)
+        if status in FINAL_STATUSES:
+            t["open_order"] = None
+            if filled > 0:
+                self.add_to_lot(s, t, filled, avg, now)
+                t["reject_count"] = 0
+            if t["bought"] >= s["target_qty"]:
+                t["done"] = True
+            if status == "CANCELED" and not o["cancel_requested"]:
+                t["done"], t["manual_buy_stop"] = True, True
+                log.info(f"[{s['name']}] 📱 앱에서 매수 주문 취소 확인 → 이 주문 중단")
+                notify(f"📱 [{s['name']}] 앱에서 매수 주문을 취소한 걸 확인했어요.\n"
+                       f"이 주문은 멈출게요. 다시 사려면 웹앱에서 숫자를 바꾸거나 '같은 조건으로 다시 매매'를 누르세요.")
+            elif status == "CANCELED" and not filled:
+                notify(f"↩️ [{s['name']}] 매수 주문 취소 완료 — 체결 없음", kakao=False)
+            elif status == "REJECTED":
+                self.ticket_error(s, t, ApiError(0, "REJECTED", "증권사에서 주문 거부"))
+            return
+        if o["cancel_requested"]:
+            return
+        age = (now - datetime.fromisoformat(o["placed_at"])).total_seconds()
+        if age > self.settings["order_timeout"]:
+            log.info(f"[{s['name']}] 매수 미체결 시간 초과 → 취소 요청")
+            notify(f"↩️ [{s['name']}] 매수 주문이 {self.settings['order_timeout']}초 안에 안 사져서 취소 요청", kakao=False)
+            if not str(o["id"]).startswith("SIM-"):
+                try:
+                    self.api.cancel_order(o["id"])
+                except ApiError as e:
+                    if e.code not in ALREADY_DONE_CODES:
+                        raise
+            o["cancel_requested"] = True
+
+    def add_to_lot(self, s, t, filled, avg, now):
+        lid = f"{s['id']}@{t['run']}"
+        lot = self.lots.get(lid)
+        if not lot:
+            lot = self.lots[lid] = {
+                "id": lid, "symbol": s["symbol"], "name": s["name"], "ticket": s["id"], "run": t["run"],
+                "qty": 0, "cost": 0, "sell_min": s["sell_min"], "stop_loss": s["stop_loss"],
+                "opened_at": now.isoformat(timespec="seconds"), "open_order": None,
+                "no_take_profit": False, "reject_count": 0, "sim": self.dry, "pnl": 0}
+        lot["qty"] += filled
+        lot["cost"] += filled * avg
+        t["bought"] += filled
+        self.recent_fill[s["symbol"]] = time.time()
+        log.info(f"[{s['name']}] ✔ 매수 체결 {filled}주 @ {won(avg)} → 보유 묶음 {lot['qty']}주")
+        notify(f"🛒 [{s['name']}] 매수 체결\n{filled}주 × {won(avg)} = {won(filled * avg)}\n"
+               f"이 묶음 {lot['qty']}주 · {won(lot['sell_min'])}↑ 매도 / {won(lot['stop_loss'])}↓ 손절", kakao=not self.dry)
+        record_trade([datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"), s["name"], s["symbol"], "매수", "구간매수",
+                      filled, avg, filled * avg, "모의" if self.dry else "실전"])
+
+    def ticket_error(self, s, t, e):
+        if e.code == "order-hours-closed":
+            self.closed_until = datetime.now(KST) + timedelta(minutes=10)
+            log.warning("거래 가능 시간이 아닙니다 (휴장일 등). 10분 뒤 다시 확인합니다.")
+            return
+        t["reject_count"] += 1
+        log.error(f"[{s['name']}] 매수 주문 실패 ({t['reject_count']}/3): {e}")
+        if t["reject_count"] >= 3:
+            t["paused"] = True
+            notify(f"⚠️ [{s['name']}] 매수 주문이 3번 연속 실패해서 이 주문을 일시정지했어요.\n"
+                   f"사유: {e.code or e}\n웹앱에서 숫자를 고치면 다시 시작해요.")
+
+    # ---------- 매도 (보유 묶음) ----------
+    def step_lot(self, lot, price, now):
+        if lot.get("open_order"):
+            self.check_sell(lot, price, now)
+            return
+        if lot["qty"] <= 0:
+            del self.lots[lot["id"]]
+            return
+        if lot.get("sell_min") is None or lot.get("stop_loss") is None:
+            return
+        stop_hit = price <= lot["stop_loss"]
+        take_hit = price >= lot["sell_min"] and not lot.get("no_take_profit")
+        if not (stop_hit or take_hit):
+            return
+        qty = lot["qty"] if (self.dry or lot.get("sim")) else min(lot["qty"], self.api.sellable(lot["symbol"]))
+        if qty <= 0:
+            self.notice_once(f"[{lot['name']}] 매도 조건이지만 매도 가능 수량이 0주 (앱에 매도 주문이 걸려 있는지 확인)")
+            return
+        if stop_hit:
+            otype, px, reason = "MARKET", None, "손절"
+            log.warning(f"[{lot['name']}] 🔻 손절 조건 — 현재가 {won(price)} ≤ {won(lot['stop_loss'])} → {qty}주 시장가 매도")
+        else:
+            otype, px, reason = "LIMIT", tick_up(lot["sell_min"]), "익절"
+            log.info(f"[{lot['name']}] 🎯 익절 조건 — 현재가 {won(price)} → {qty}주 {won(px)} 지정가 매도")
+        sim = self.dry or lot.get("sim")
+        oid = "SIM-" + uuid.uuid4().hex[:12] if sim else self.api.place_order(lot["symbol"], "SELL", qty, otype, px)
+        lot["open_order"] = {"id": oid, "side": "SELL", "type": otype, "qty": qty, "price": px, "reason": reason,
+                             "placed_at": now.isoformat(), "cancel_requested": False}
+        notify(f"📝 [{lot['name']}] {reason} 매도 주문 접수\n{qty}주 · {'시장가' if px is None else won(px) + ' 지정가'}"
+               + ("" if sim else "\n취소하려면 토스 앱 → 주문내역 → 대기에서 취소하세요."), kakao=not sim)
+
+    def check_sell(self, lot, price, now):
+        o = lot["open_order"]
+        status, filled, avg = self.fetch(o, price)
+        sim = self.dry or lot.get("sim")
+        if status in FINAL_STATUSES:
+            lot["open_order"] = None
+            if filled > 0:
+                avgc = lot["cost"] / lot["qty"] if lot["qty"] else avg
+                pnl = int((avg - avgc) * filled)
+                lot["qty"] -= filled
+                lot["cost"] = int(avgc * lot["qty"])
+                lot["pnl"] = lot.get("pnl", 0) + pnl
+                self.state["pnl"] = self.state.get("pnl", 0) + pnl
+                lot["reject_count"] = 0
+                self.recent_fill[lot["symbol"]] = time.time()
+                icon = "🔻" if o["reason"] == "손절" else "🎯"
+                tail = "이 묶음은 정리 끝" if lot["qty"] == 0 else f"이 묶음 남은 수량 {lot['qty']}주"
+                log.info(f"[{lot['name']}] ✔ {o['reason']} 매도 체결 {filled}주 @ {won(avg)} — 손익 {pnl:+,}원 ({tail})")
+                notify(f"{icon} [{lot['name']}] {o['reason']} 매도 체결\n{filled}주 × {won(avg)} = {won(filled * avg)}\n"
+                       f"손익 약 {pnl:+,}원 (수수료·세금 제외)\n{tail}", kakao=not sim)
+                record_trade([datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"), lot["name"], lot["symbol"], "매도",
+                              o["reason"], filled, avg, filled * avg, "모의" if sim else "실전"])
+                if lot["qty"] <= 0:
+                    del self.lots[lot["id"]]
+                    return
+            if status == "CANCELED" and not o["cancel_requested"]:
+                if o["reason"] != "손절":
+                    lot["no_take_profit"] = True
+                    notify(f"📱 [{lot['name']}] 앱에서 매도 주문을 취소한 걸 확인했어요.\n"
+                           f"이 묶음의 익절 매도는 멈추고, 손절가는 계속 지켜볼게요.")
+            elif status == "CANCELED" and not filled:
+                notify(f"↩️ [{lot['name']}] 매도 주문 취소 완료 — 체결 없음", kakao=False)
+            elif status == "REJECTED":
+                self.lot_error(lot, ApiError(0, "REJECTED", "증권사에서 주문 거부"))
+            return
+        if o["cancel_requested"]:
+            return
+        age = (now - datetime.fromisoformat(o["placed_at"])).total_seconds()
+        why = None
+        if price <= lot["stop_loss"] and o["type"] == "LIMIT":
+            why = "손절가 도달 — 손절 우선"
+        elif age > self.settings["order_timeout"] and o["type"] == "LIMIT" and price < lot["sell_min"]:
+            why = "가격이 매도가 아래로 내려감"
+        if why:
+            log.info(f"[{lot['name']}] 매도 주문 취소 요청 ({why})")
+            notify(f"↩️ [{lot['name']}] 봇이 매도 주문 취소 요청 ({why})", kakao=False)
+            if not str(o["id"]).startswith("SIM-"):
+                try:
+                    self.api.cancel_order(o["id"])
+                except ApiError as e:
+                    if e.code not in ALREADY_DONE_CODES:
+                        raise
+            o["cancel_requested"] = True
+
+    def lot_error(self, lot, e):
+        if e.code == "order-hours-closed":
+            self.closed_until = datetime.now(KST) + timedelta(minutes=10)
+            log.warning("거래 가능 시간이 아닙니다 (휴장일 등). 10분 뒤 다시 확인합니다.")
+            return
+        lot["reject_count"] = lot.get("reject_count", 0) + 1
+        log.error(f"[{lot['name']}] 매도 주문 실패 ({lot['reject_count']}): {e}")
+        if lot["reject_count"] % 3 == 0:
+            notify(f"⚠️ [{lot['name']}] 매도 주문이 계속 실패하고 있어요 ({lot['reject_count']}번).\n"
+                   f"사유: {e.code or e}\n토스 앱에서 직접 확인해 주세요. 봇은 계속 다시 시도해요.")
+
+    # ---------- 웹앱 현황 ----------
+    def build_status(self, now, market):
+        def order_view(oo):
+            if not oo:
+                return None
+            return {"side": "매수" if oo["side"] == "BUY" else "매도", "qty": oo["qty"], "price": oo["price"],
+                    "type": "시장가" if oo["type"] == "MARKET" else "지정가", "reason": oo["reason"],
+                    "placed_at": oo["placed_at"], "canceling": oo.get("cancel_requested", False)}
+        tickets = []
+        for s in self.stocks:
+            t = self.tickets.get(s["id"]) or new_ticket()
+            if t["paused"]:
                 label = "일시정지"
-            elif st.get("done"):
-                label = "매매 완료"
-            elif oo:
-                label = "주문 대기 중"
-            elif held > 0:
-                label = "보유 중 · 매도 대기"
+            elif t.get("manual_buy_stop"):
+                label = "매수 중단 (앱에서 취소)"
+            elif t["done"]:
+                label = "매수 완료"
+            elif t["open_order"]:
+                label = "매수 주문 대기 중"
+            elif t["bought"]:
+                label = f"일부 매수 ({t['bought']}/{s['target_qty']}주)"
             else:
                 label = "매수 대기"
+            tickets.append({"id": s["id"], "name": s["name"], "symbol": s["symbol"],
+                            "price": self.last_prices.get(s["symbol"]), "label": label,
+                            "bought": t["bought"], "target": s["target_qty"],
+                            "buy_min": s["buy_min"], "buy_max": s["buy_max"], "order": order_view(t["open_order"])})
+        lots = []
+        for l in sorted(self.lots.values(), key=lambda x: x["opened_at"]):
             notes = []
-            if st.get("manual_buy_stop"):
-                notes.append("앱에서 매수 취소 → 매수 멈춤")
-            if st.get("no_take_profit"):
+            if l.get("no_take_profit"):
                 notes.append("앱에서 매도 취소 → 익절 멈춤 (손절은 감시 중)")
-            rows.append({
-                "symbol": s["symbol"], "name": s["name"], "price": self.last_prices.get(s["symbol"]),
-                "held": held, "avg": int(st["buy_amount"] / held) if held else None,
-                "label": label, "notes": notes, "pnl": st.get("realized_pnl", 0),
-                "order": None if not oo else {
-                    "side": "매수" if oo["side"] == "BUY" else "매도", "qty": oo["qty"], "price": oo["price"],
-                    "type": "시장가" if oo["type"] == "MARKET" else "지정가", "reason": oo["reason"],
-                    "placed_at": oo["placed_at"], "canceling": oo.get("cancel_requested", False)},
-            })
+            if l.get("sim"):
+                notes.append("모의 매매 묶음")
+            lots.append({"id": l["id"], "name": l["name"], "symbol": l["symbol"], "qty": l["qty"],
+                         "avg": int(l["cost"] / l["qty"]) if l["qty"] else None,
+                         "price": self.last_prices.get(l["symbol"]), "sell_min": l["sell_min"],
+                         "stop_loss": l["stop_loss"], "opened_at": l["opened_at"], "pnl": l.get("pnl", 0),
+                         "order": order_view(l.get("open_order")), "notes": notes})
         return {"updated_at": now.isoformat(timespec="seconds"), "market_open": market,
                 "mode": "모의" if self.dry else "실전", "started_at": self.started_at,
-                "stocks": rows, "events": EVENTS[-30:]}
+                "pnl": self.state.get("pnl", 0), "tickets": tickets, "lots": lots, "events": EVENTS[-30:]}
 
     def publish(self, now, market):
         if not GH_FILE.exists():
             return          # 현황 저장소 연결 전 — 연결되면 바로 올라감
         payload = self.build_status(now, market)
+        strip = lambda rows: [{k: v for k, v in r.items() if k != "price"} for r in rows]
         fp = json.dumps([payload["mode"], payload["market_open"], payload["events"][-1:],
-                         [{k: v for k, v in r.items() if k != "price"} for r in payload["stocks"]]], ensure_ascii=False)
+                         strip(payload["tickets"]), strip(payload["lots"])], ensure_ascii=False)
         wait = 60 if market else 600
         if fp != self.last_fp or time.time() - self.last_pub >= wait:
             self.last_fp, self.last_pub = fp, time.time()
             self.publisher.submit(payload)
 
-    def handle_order_error(self, s, e):
-        st = self.state[s["symbol"]]
-        if e.code == "order-hours-closed":
-            self.closed_until = datetime.now(KST) + timedelta(minutes=10)
-            log.warning("거래 가능 시간이 아닙니다 (휴장일 등). 10분 뒤 다시 확인합니다.")
-            return
-        st["reject_count"] += 1
-        log.error(f"[{s['name']}] 주문 실패 ({st['reject_count']}/3): {e}")
-        if st["reject_count"] >= 3:
-            st["paused"] = True
-            log.error(f"[{s['name']}] 연속 실패로 이 종목을 일시정지했습니다. "
-                      f"원인 확인 후 --reset 하거나 상태를 점검하세요.")
-            notify(f"⚠️ [{s['name']}] 주문이 3번 연속 실패해서 일시정지했어요.\n"
-                   f"사유: {e.code or e}\n웹앱에서 숫자를 고치면 다시 시작해요.")
 
-    def sync_holding(self, s, st, real, now):
-        """실제 계좌 수량을 봇 장부에 반영 (핸드폰으로 사고판 것 포함)"""
-        if st["open_order"]:
-            return                      # 주문 진행 중엔 주문 결과로 판단
-        last = st.get("last_fill_at")
-        if last and (now - datetime.fromisoformat(last)).total_seconds() < 30:
-            return                      # 체결 직후 계좌 반영 지연 대비 30초 유예
-        real_qty, real_avg = real
-        new_qty = max(0, real_qty + (st["sim_offset"] if self.dry else 0))
-        if new_qty == st["held_qty"]:
-            return
-        log.info(f"[{s['name']}] 📱 계좌 수량 변화 감지: {st['held_qty']}주 → {new_qty}주 (앱 거래 반영)")
-        st["held_qty"] = new_qty
-        if self.dry:
-            st["buy_amount"] = max(0, real_avg * real_qty + st.get("sim_cost", 0))
-        else:
-            st["buy_amount"] = real_avg * new_qty
-
-    def sell_qty(self, s, st) -> int:
-        if s["sync"] and not self.dry:
-            return min(self.api.sellable(s["symbol"]), st["held_qty"]) if st["held_qty"] else 0
-        return st["held_qty"]
-
-    # 한 종목 판단
-    def step(self, s, st, price, now):
-        if st["open_order"]:
-            self.check_open_order(s, st, price, now)
-            return
-
-        held = st["held_qty"]
-        stop_hit = held > 0 and price <= s["stop_loss"]
-        take_hit = held > 0 and price >= s["sell_min"] and not st.get("no_take_profit")
-        if stop_hit or take_hit:
-            st["buy_complete"] = True
-            qty = self.sell_qty(s, st)
-            if qty <= 0:
-                self.notice_once(f"[{s['name']}] 매도 조건이지만 매도 가능 수량이 0주 (앱에서 매도 주문 걸려 있는지 확인)")
-            elif stop_hit:
-                log.warning(f"[{s['name']}] 🔻 손절 조건 — 현재가 {won(price)} ≤ {won(s['stop_loss'])} → {qty}주 시장가 매도")
-                self.order(s, st, "SELL", qty, "MARKET", None, "손절", price, now)
-            else:
-                log.info(f"[{s['name']}] 🎯 익절 조건 — 현재가 {won(price)} → {qty}주 {won(s['sell_price'])} 지정가 매도")
-                self.order(s, st, "SELL", qty, "LIMIT", s["sell_price"], "익절", price, now)
-        elif not st["buy_complete"] and s["buy_min"] <= price <= s["buy_max"]:
-            remain = s["target_qty"] - held
-            if remain <= 0:
-                st["buy_complete"] = True
-                return
-            log.info(f"[{s['name']}] 🛒 매수 구간 진입 — 현재가 {won(price)} → {remain}주 {won(s['buy_price'])} 이하 지정가 매수")
-            self.order(s, st, "BUY", remain, "LIMIT", s["buy_price"], "구간매수", price, now)
-
-        if st["buy_complete"] and st["held_qty"] == 0 and not st["open_order"]:
-            st["done"] = True
-            log.info(f"[{s['name']}] ✅ 매매 완료 — 누적 손익(수수료·세금 제외) {st['realized_pnl']:+,}원")
-
-    def order(self, s, st, side, qty, otype, price, reason, cur_price, now):
-        if self.dry:
-            oid = "SIM-" + uuid.uuid4().hex[:12]
-        else:
-            oid = self.api.place_order(s["symbol"], side, qty, otype, price)
-        st["open_order"] = {"id": oid, "side": side, "type": otype, "qty": qty, "price": price,
-                            "reason": reason, "placed_at": now.isoformat(), "cancel_requested": False}
-        how = "시장가" if otype == "MARKET" else f"{won(price)} 지정가"
-        notify(f"📝 [{s['name']}] {'매수' if side == 'BUY' else '매도'} 주문 접수 ({reason})\n"
-               f"{qty}주 · {how}" + ("" if self.dry else "\n취소하려면 토스 앱 → 주문내역 → 대기에서 취소하세요."),
-               kakao=not self.dry)
-
-    def cancel_orphan_orders(self):
-        """웹앱에서 끄거나 지운 종목에 걸려 있던 주문 취소"""
-        on = {s["symbol"] for s in self.stocks}
-        changed = False
-        for sym, st in self.state.items():
-            oo = st.get("open_order")
-            if not oo or sym in on:
-                continue
-            if not self.dry and not str(oo["id"]).startswith("SIM-"):
-                try:
-                    self.api.cancel_order(oo["id"])
-                except ApiError as e:
-                    if e.code not in ALREADY_DONE_CODES:
-                        log.error(f"[{sym}] 꺼진 종목 주문 취소 실패: {e}")
-                        continue
-                notify(f"🛑 [{sym}] 종목을 꺼서 걸려 있던 주문을 취소했어요.")
-            log.info(f"[{sym}] 종목이 꺼져서 대기 주문을 취소했습니다")
-            st["open_order"] = None
-            st["last_fill_at"] = datetime.now(KST).isoformat()
-            changed = True
-        if changed:
-            save_state(self.state)
-
-    def check_open_order(self, s, st, price, now):
-        o = st["open_order"]
-        if self.dry:
-            # 모의 체결: 지정가는 유리한 쪽으로 즉시 체결된 것으로 가정
-            if o["type"] == "MARKET":
-                fill_px = price
-            elif o["side"] == "BUY":
-                fill_px = min(price, o["price"])
-            else:
-                fill_px = max(price, o["price"])
-            status, filled, avg = "FILLED", o["qty"], fill_px
-        else:
-            info = self.api.get_order(o["id"])
-            ex = info.get("execution") or {}
-            status = info.get("status")
-            filled = to_int(ex.get("filledQuantity"))
-            avg = to_int(ex.get("averageFilledPrice")) or (o["price"] or price)
-
-        if status in FINAL_STATUSES:
-            self.apply_fill(s, st, o, status, filled, avg)
-            st["last_fill_at"] = now.isoformat()
-            st["open_order"] = None
-            if status == "REJECTED":
-                self.handle_order_error(s, ApiError(0, "REJECTED", "거래소/증권사에서 주문 거부"))
-            elif filled > 0:
-                st["reject_count"] = 0
-            if status == "CANCELED" and not o["cancel_requested"]:
-                # 봇이 취소한 게 아니라 사장님이 토스 앱에서 직접 취소함 → 같은 주문 반복 금지
-                if o["side"] == "BUY":
-                    st["buy_complete"], st["manual_buy_stop"] = True, True
-                    log.info(f"[{s['name']}] 📱 앱에서 매수 주문 취소 확인 → 매수 중단")
-                    notify(f"📱 [{s['name']}] 앱에서 매수 주문을 취소한 걸 확인했어요.\n"
-                           f"더 이상 사지 않아요. 다시 사려면 웹앱에서 숫자를 바꾸거나 '같은 조건으로 다시 매매'를 누르세요.")
-                elif o["reason"] != "손절":
-                    st["no_take_profit"] = True
-                    log.info(f"[{s['name']}] 📱 앱에서 매도 주문 취소 확인 → 익절 매도 중단 (손절은 계속 감시)")
-                    notify(f"📱 [{s['name']}] 앱에서 매도 주문을 취소한 걸 확인했어요.\n"
-                           f"익절 매도는 멈추고, 손절가는 계속 지켜볼게요.")
-            return
-
-        # 아직 미체결 — 취소가 필요한지 판단
-        if o["cancel_requested"]:
-            return
-        age = (now - datetime.fromisoformat(o["placed_at"])).total_seconds()
-        why = None
-        if price <= s["stop_loss"] and not (o["side"] == "SELL" and o["type"] == "MARKET"):
-            why = "손절가 도달 — 손절 우선"
-        elif age > self.settings["order_timeout"]:
-            if o["side"] == "BUY":
-                why = "매수 미체결 시간 초과"
-            elif o["type"] == "LIMIT" and price < s["sell_min"]:
-                why = "가격이 매도 구간을 벗어남"
-        if why:
-            log.info(f"[{s['name']}] 주문 취소 요청 ({why})")
-            notify(f"↩️ [{s['name']}] 봇이 주문 취소 요청 ({why})", kakao=False)
-            try:
-                self.api.cancel_order(o["id"])
-            except ApiError as e:
-                if e.code not in ALREADY_DONE_CODES:
-                    raise
-            o["cancel_requested"] = True
-
-    def apply_fill(self, s, st, o, status, filled, avg):
-        if filled <= 0:
-            log.info(f"[{s['name']}] 주문 종료({status}) — 체결 없음")
-            if status == "CANCELED" and o.get("cancel_requested"):
-                notify(f"↩️ [{s['name']}] 주문 취소 완료 — 체결 없음", kakao=False)
-            elif status == "REJECTED":
-                notify(f"⛔ [{s['name']}] 주문 거부됨", kakao=False)
-            return
-        amount = filled * avg
-        if self.dry:   # 모의 체결분은 실제 계좌에 없으므로 따로 기억
-            st["sim_offset"] += filled if o["side"] == "BUY" else -filled
-            if o["side"] == "BUY":
-                st["sim_cost"] = st.get("sim_cost", 0) + amount
-            elif st["held_qty"]:
-                st["sim_cost"] = st.get("sim_cost", 0) - int(st["buy_amount"] / st["held_qty"] * filled)
-        if o["side"] == "BUY":
-            st["held_qty"] += filled
-            st["buy_amount"] += amount
-            if st["held_qty"] >= s["target_qty"]:
-                st["buy_complete"] = True
-            log.info(f"[{s['name']}] ✔ 매수 체결 {filled}주 @ {won(avg)} (보유 {st['held_qty']}주)")
-            notify(f"🛒 [{s['name']}] 매수 체결\n{filled}주 × {won(avg)} = {won(amount)}\n"
-                   f"보유 {st['held_qty']}주", kakao=not self.dry)
-        else:
-            held_before = st["held_qty"]
-            avg_buy = st["buy_amount"] / held_before if held_before else avg
-            pnl = int((avg - avg_buy) * filled)
-            st["realized_pnl"] += pnl
-            st["held_qty"] -= filled
-            st["buy_amount"] = int(avg_buy * st["held_qty"])
-            log.info(f"[{s['name']}] ✔ 매도 체결({o['reason']}) {filled}주 @ {won(avg)} — 손익 {pnl:+,}원 (남은 {st['held_qty']}주)")
-            icon = "🔻" if o["reason"] == "손절" else "🎯"
-            notify(f"{icon} [{s['name']}] {o['reason']} 매도 체결\n{filled}주 × {won(avg)} = {won(amount)}\n"
-                   f"손익 약 {pnl:+,}원 (수수료·세금 제외)\n남은 수량 {st['held_qty']}주", kakao=not self.dry)
-        record_trade([datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"), s["name"], s["symbol"],
-                      "매수" if o["side"] == "BUY" else "매도", o["reason"], filled, avg, amount,
-                      "모의" if self.dry else "실전"])
+def seed_events_from_trades():
+    """예전 체결 기록(trades.csv) 중 '최근 기록'에 없는 것을 복원"""
+    if not TRADES_FILE.exists():
+        return
+    try:
+        with open(TRADES_FILE, encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))[1:]
+    except Exception:
+        return
+    have = {(e["t"][:16], e["text"][:1]) for e in EVENTS}
+    added = False
+    for r in rows[-30:]:
+        try:
+            ts, name, sym, side, reason, qty, avg, amount, mode = r[:9]
+            t = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST).isoformat(timespec="seconds")
+        except Exception:
+            continue
+        icon = "🛒" if side == "매수" else ("🔻" if reason == "손절" else "🎯")
+        if (t[:16], icon) in have:
+            continue
+        have.add((t[:16], icon))
+        tag = " (모의)" if mode == "모의" else ""
+        EVENTS.append({"t": t, "text": f"{icon} [{name}] {side} 체결{tag}\n{qty}주 × {won(avg)} = {won(amount)}"})
+        added = True
+    if added:
+        EVENTS.sort(key=lambda e: e["t"])
+        del EVENTS[:-60]
+        try:
+            EVENTS_FILE.write_text(json.dumps(EVENTS, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
 
 # ─────────────────────────── 실행 ───────────────────────────
@@ -852,23 +1045,16 @@ def main():
         print("보냈습니다. 카카오톡 '나와의 채팅'을 확인하세요.")
         return
     if args[:1] == ["--status"]:
-        state = load_state()
-        if not state:
-            print("저장된 상태가 없습니다.")
-        for sym, st in state.items():
-            flag = "완료" if st["done"] else "일시정지" if st["paused"] else "진행중"
-            print(f"{sym}: {flag} | 보유 {st['held_qty']}주 | 미체결 {'있음' if st['open_order'] else '없음'} "
-                  f"| 누적손익 {st['realized_pnl']:+,}원")
-        return
-    if args[:1] == ["--reset"] and len(args) == 2:
-        state = load_state()
-        sym = args[1].zfill(6)
-        st = state.get(sym)
-        if st and (st["held_qty"] > 0 or st["open_order"]):
-            sys.exit(f"⚠️  {sym}은 보유 주식 또는 미체결 주문이 있어 초기화하지 않았습니다. 앱에서 먼저 정리하세요.")
-        state.pop(sym, None)
-        save_state(state)
-        print(f"{sym} 상태를 초기화했습니다. 다음 실행 때 처음부터 다시 매매합니다.")
+        st = load_state()
+        if st.get("version") != 2:
+            print("아직 새 구조로 옮겨지지 않았습니다 (봇이 한 번 실행되면 옮겨져요).")
+            return
+        for tid, t in st["tickets"].items():
+            flag = "완료" if t["done"] else "일시정지" if t["paused"] else "진행중"
+            print(f"주문 {tid}: {flag} | 산 수량 {t['bought']}주 | 대기 주문 {'있음' if t['open_order'] else '없음'}")
+        for lid, l in st["lots"].items():
+            print(f"묶음 {lid}: {l['name']} {l['qty']}주 | 매도 {l['sell_min']} / 손절 {l['stop_loss']}")
+        print(f"누적 실현손익 {st.get('pnl', 0):+,}원")
         return
     try:
         Bot().run()

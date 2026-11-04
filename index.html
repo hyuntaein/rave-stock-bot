@@ -250,11 +250,13 @@ function normalize(){
     dry_run: true, check_interval_sec: 5, order_timeout_sec: 60,
     max_budget_per_stock: 10000000, trade_start: "09:00", trade_end: "15:19",
   }, cfg.settings || {});
-  cfg.stocks = (cfg.stocks || []).map(s => ({
+  cfg.released_lots = (cfg.released_lots || []).map(String);
+  cfg.stocks = (cfg.stocks || []).map((s, i) => ({
+    id: String(s.id || `${String(s.symbol ?? "").padStart(6, "0").slice(-6)}#${i}`),
     name: s.name ?? "", symbol: String(s.symbol ?? "").padStart(6, "0").slice(-6),
     enabled: s.enabled !== false, budget: digits(s.budget), buy_min: digits(s.buy_min), buy_max: digits(s.buy_max),
     sell_min: digits(s.sell_min), stop_loss: digits(s.stop_loss),
-    account_sync: s.account_sync !== false, round: digits(s.round) || 0,
+    round: digits(s.round) || 0,
   }));
 }
 
@@ -281,19 +283,21 @@ function toYaml(){
   if (!cfg.stocks.length) L[L.length - 1] = "stocks: []";
   for (const k of cfg.stocks){
     L.push(
-      `  - name: ${q(k.name)}`,
+      `  - id: ${q(k.id)}                 # 주문 카드 번호 (바꾸지 마세요)`,
+      `    name: ${q(k.name)}`,
       `    symbol: ${q(k.symbol)}           # 종목코드 6자리`,
       `    enabled: ${!!k.enabled}              # false = 이 종목은 쉼`,
       `    budget: ${k.budget ?? 0}            # 이 종목에 쓸 금액`,
       `    buy_min: ${k.buy_min ?? 0}            # 매수 범위 시작`,
       `    buy_max: ${k.buy_max ?? 0}            # 매수 범위 끝`,
-      `    sell_min: ${k.sell_min ?? 0}           # 이 가격 이상이면 전량 매도`,
-      `    stop_loss: ${k.stop_loss ?? 0}          # 이 가격 이하면 전량 손절`,
-      `    account_sync: ${!!k.account_sync}         # true = 토스 계좌 실제 수량을 따라감`,
-      `    round: ${k.round || 0}                  # 숫자가 바뀌면 같은 조건으로 다시 매매`,
+      `    sell_min: ${k.sell_min ?? 0}           # 이 주문으로 산 묶음: 이 가격 이상이면 전량 매도`,
+      `    stop_loss: ${k.stop_loss ?? 0}          # 이 주문으로 산 묶음: 이 가격 이하면 전량 손절`,
+      `    round: ${k.round || 0}                  # 숫자가 바뀌면 같은 조건으로 새 주문`,
       ""
     );
   }
+  L.push("# 웹앱에서 '조건 해제'한 보유 묶음 (봇이 더 이상 팔지 않음)",
+         "released_lots: " + JSON.stringify(cfg.released_lots || []), "");
   return L.join("\n");
 }
 
@@ -330,7 +334,8 @@ function render(){
         <input type="text" data-k="name" placeholder="종목 이름 (예: 삼성전자)" style="flex:1">
         <label class="switch" title="켜기/끄기"><input type="checkbox" data-k="enabled"><span></span></label>
       </div>
-      <div class="muted" style="margin-top:8px;line-height:1.5">오른쪽 스위치를 끄고 저장하면 이 종목 매매를 멈추고, 걸려 있던 주문도 취소해요.</div>
+      <div data-tstat style="margin-top:10px"></div>
+      <div class="muted" style="margin-top:8px;line-height:1.5">스위치를 끄면 이 주문의 매수를 멈추고 대기 중인 매수 주문을 취소해요. 이미 산 묶음은 위 현황에서 따로 관리돼요.</div>
       <label class="f">종목코드 6자리</label>
       <input type="text" inputmode="numeric" maxlength="6" data-k="symbol" placeholder="005930">
       <label class="f">이 종목에 쓸 금액</label>
@@ -345,10 +350,7 @@ function render(){
       </div>
       <div class="summary" data-sum></div>
       <div class="err" data-err></div>
-      <div class="opt">
-        <div><div class="t">핸드폰 거래도 반영</div><div class="d">켜면 계좌에 있는 이 종목 전체를 기준으로 사고팔아요.<br>장기 보유 중인 종목이면 꺼두세요.</div></div>
-        <label class="switch"><input type="checkbox" data-k="account_sync"><span></span></label>
-      </div>
+      <div class="muted" style="margin-top:10px;line-height:1.5">💡 체결된 뒤 금액이나 매수 범위를 바꾸면 <b>새 주문</b>으로 인식해서 따로 사요. 먼저 산 묶음은 그 조건 그대로예요.</div>
       <div class="actions">
         <button class="btn plain" data-act="again">같은 조건으로 다시 매매</button>
         <button class="btn danger" data-act="del">삭제</button>
@@ -357,7 +359,6 @@ function render(){
     inp("name").value = k.name;
     inp("symbol").value = k.symbol;
     inp("enabled").checked = k.enabled;
-    inp("account_sync").checked = k.account_sync;
     for (const key of ["budget","buy_min","buy_max","sell_min","stop_loss"]) inp(key).value = fmt(k[key]);
 
     c.addEventListener("input", (ev) => {
@@ -375,15 +376,17 @@ function render(){
     });
     c.addEventListener("change", (ev) => { const key = ev.target.dataset.k; if (ev.target.type === "checkbox" && key){ k[key] = ev.target.checked; update(c, k); } });
     c.querySelector('[data-act="del"]').onclick = () => {
-      if (!confirm(`'${k.name || "이 종목"}'을(를) 지울까요?\n이미 사둔 주식이 있다면 봇이 더 이상 팔지 않아요.`)) return;
+      if (!confirm(`'${k.name || "이 주문"}' 주문 카드를 지울까요?\n대기 중인 매수 주문은 취소돼요.\n이미 산 묶음은 현황에서 계속 관리돼요 (멈추려면 묶음의 '조건 해제').`)) return;
       cfg.stocks.splice(i, 1); render();
     };
     c.querySelector('[data-act="again"]').onclick = () => {
       k.round = (k.round || 0) + 1; update(c, k);
-      toast("저장하면, 매매가 끝난 이 종목을 같은 조건으로 다시 시작해요.", "info");
+      toast("저장하면, 같은 조건으로 새 매수 주문을 시작해요.", "info");
     };
+    c.dataset.tid = k.id;
     box.appendChild(c);
     update(c, k);
+    paintTicket(c, k.id);
   });
   refreshSave();
 }
@@ -441,7 +444,21 @@ function kstMarketOpen(){
   const m = k.getHours() * 60 + k.getMinutes(), d = k.getDay();
   return d >= 1 && d <= 5 && m >= 540 && m < 920;
 }
-let stTimer = null;
+let stTimer = null, lastStatus = null;
+function paintTicket(card, tid){
+  const box = card.querySelector("[data-tstat]"); if (!box) return;
+  const t = lastStatus && (lastStatus.tickets || []).find(x => x.id === tid);
+  if (!t){ box.innerHTML = ""; return; }
+  const cls = t.label.includes("대기 중") ? "wait" : t.label.includes("완료") ? "done" : t.label.includes("중단") || t.label.includes("정지") ? "stop" : "hold";
+  box.innerHTML = `<span class="pill ${cls}">${esc(t.label)}</span> <span class="muted">현재가 ${t.price ? fmt(t.price) + "원" : "-"} · 산 수량 ${t.bought}/${t.target}주</span>`;
+}
+async function releaseLot(id, name, qty){
+  if (cfg.stocks.some(k => check(k).length)){ alert("주문 카드에 빨간 글씨(입력 오류)가 있어서 저장할 수 없어요. 먼저 고쳐주세요."); return; }
+  if (!confirm(`${name} ${qty}주 묶음의 매도·손절 조건을 해제할까요?\n\n봇이 이 묶음을 더 이상 팔지 않아요.\n주식은 계좌에 그대로 남아요 (팔려면 토스 앱에서 직접).`)) return;
+  if (!cfg.released_lots.includes(id)) cfg.released_lots.push(id);
+  await save();
+  loadStatus();
+}
 async function loadStatus(){
   let r;
   try {
@@ -458,22 +475,33 @@ async function loadStatus(){
   const dot = stale ? "warn" : (st.market_open ? "ok" : "off");
   $("stMeta").innerHTML = `<span class="dot ${dot}"></span>${st.mode === "실전" ? "🔴 실전" : "🧪 모의"} · ${st.market_open ? "장중 감시 중" : "장 마감 — 대기 중"} · ${ago(st.updated_at)} 확인`
     + (stale ? `<br><span style="color:#d9480f">⚠️ 봇 소식이 한동안 없어요. 서버가 꺼졌는지 확인이 필요할 수 있어요.</span>` : "");
-  $("stRows").innerHTML = (st.stocks || []).map(x => {
-    const cls = x.label.includes("대기 중") ? "wait" : x.label.includes("보유") ? "hold" : x.label.includes("완료") ? "done" : x.label.includes("정지") ? "stop" : "";
-    const pl = (x.held && x.avg && x.price) ? ((x.price / x.avg - 1) * 100) : null;
-    let h = `<div class="srow"><div class="row"><div><span class="sname">${esc(x.name)}</span> <span class="muted">${esc(x.symbol)}</span></div>
-      <div class="sprice">${x.price ? fmt(x.price) + "원" : "-"}</div></div>
-      <div style="margin-top:8px"><span class="pill ${cls}">${esc(x.label)}</span></div>
-      <div class="kv"><span>보유</span><b>${x.held ? x.held + "주 · 평균 " + fmt(x.avg) + "원" : "없음"}${pl !== null ? ` <span style="color:${pl >= 0 ? "var(--red)" : "var(--blue)"}">(${pl >= 0 ? "+" : ""}${pl.toFixed(1)}%)</span>` : ""}</b></div>`;
-    if (x.pnl) h += `<div class="kv"><span>실현 손익 (누적)</span><b style="color:${x.pnl >= 0 ? "var(--red)" : "var(--blue)"}">${x.pnl >= 0 ? "+" : ""}${fmt(x.pnl)}원</b></div>`;
-    if (x.order){
-      const o = x.order;
-      h += `<div class="order">⏳ <b>${o.side} 주문 ${o.canceling ? "취소 중" : "대기 중"}</b> · ${o.qty}주 · ${o.price ? fmt(o.price) + "원 " : ""}${o.type} (${esc(o.reason)})<br>
+  lastStatus = st;
+  const orderBox = (o) => !o ? "" : `<div class="order">⏳ <b>${o.side} 주문 ${o.canceling ? "취소 중" : "대기 중"}</b> · ${o.qty}주 · ${o.price ? fmt(o.price) + "원 " : ""}${o.type} (${esc(o.reason)})<br>
         <span style="font-size:12px">${hm(o.placed_at)} 접수 · 취소하려면 토스 앱 → 주문내역 → 대기</span></div>`;
-    }
+  const lots = st.lots || [];
+  let html = `<div class="muted" style="margin:10px 0 2px;font-weight:700">보유 묶음 ${lots.length}개</div>`;
+  html += lots.map(x => {
+    const pl = (x.avg && x.price) ? ((x.price / x.avg - 1) * 100) : null;
+    let h = `<div class="srow"><div class="row"><div><span class="sname">${esc(x.name)}</span> <span class="muted">${x.qty}주</span></div>
+      <div class="sprice">${x.price ? fmt(x.price) + "원" : "-"}</div></div>
+      <div class="kv"><span>평균 매수가</span><b>${fmt(x.avg)}원${pl !== null ? ` <span style="color:${pl >= 0 ? "var(--red)" : "var(--blue)"}">(${pl >= 0 ? "+" : ""}${pl.toFixed(1)}%)</span>` : ""}</b></div>
+      <div class="kv"><span>🎯 매도 / 🔻 손절</span><b>${fmt(x.sell_min)}원↑ / ${fmt(x.stop_loss)}원↓</b></div>
+      <div class="kv"><span>산 날짜</span><b>${hm(x.opened_at)}</b></div>`;
+    h += orderBox(x.order);
     for (const n of x.notes || []) h += `<div class="muted" style="margin-top:8px">ℹ️ ${esc(n)}</div>`;
+    const rel = (cfg.released_lots || []).includes(x.id);
+    h += rel ? `<div class="muted" style="margin-top:10px">🔓 조건 해제 요청됨 — 1분 안에 반영돼요</div>`
+             : `<button class="btn plain" style="margin-top:10px" data-release="${esc(x.id)}" data-qty="${x.qty}" data-name="${esc(x.name)}">조건 해제 (봇이 안 팔게)</button>`;
     return h + "</div>";
-  }).join("") || `<div class="muted" style="margin-top:8px">켜져 있는 종목이 없어요.</div>`;
+  }).join("") || `<div class="muted" style="margin-top:6px">봇이 산 주식이 없어요.</div>`;
+  const tks = (st.tickets || []).filter(x => x.order);
+  if (tks.length){
+    html += `<div class="muted" style="margin:16px 0 2px;font-weight:700">대기 중인 매수 주문</div>`;
+    html += tks.map(x => `<div class="srow"><div class="row"><span class="sname">${esc(x.name)}</span><span class="sprice">${x.price ? fmt(x.price) + "원" : "-"}</span></div>${orderBox(x.order)}</div>`).join("");
+  }
+  $("stRows").innerHTML = html;
+  $("stRows").querySelectorAll("[data-release]").forEach(btn => btn.onclick = () => releaseLot(btn.dataset.release, btn.dataset.name, btn.dataset.qty));
+  document.querySelectorAll("#stocks .card").forEach(c => paintTicket(c, c.dataset.tid));
   const evs = (st.events || []).slice().reverse();
   const row = (e) => `<div class="ev"><time>${hm(e.t)}</time><div>${esc(e.text)}</div></div>`;
   $("evList").innerHTML = !evs.length ? `<div class="muted">아직 기록이 없어요.</div>`
@@ -495,7 +523,7 @@ $("mLive").onclick = () => {
   cfg.settings.dry_run = false; render();
 };
 $("addBtn").onclick = () => {
-  cfg.stocks.push({ name:"", symbol:"", enabled:true, budget:null, buy_min:null, buy_max:null, sell_min:null, stop_loss:null, account_sync:true, round:0 });
+  cfg.stocks.push({ id: "t" + Date.now().toString(36), name:"", symbol:"", enabled:true, budget:null, buy_min:null, buy_max:null, sell_min:null, stop_loss:null, round:0 });
   render(); window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
 };
 $("maxBudget").addEventListener("input", (ev) => {
