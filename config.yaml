@@ -17,7 +17,7 @@ stocks:
     name: "SK하이닉스"
     symbol: "000660"           # 종목코드 6자리
     enabled: true              # false = 이 종목은 쉼
-    budget: 3000000            # 이 종목에 쓸 금액
+    budget: 7400000            # 이 종목에 쓸 금액
     buy_min: 1220000            # 매수 범위 시작
     buy_max: 1225000            # 매수 범위 끝
     sell_min: 1450000           # 이 주문으로 산 묶음: 이 가격 이상이면 전량 매도
