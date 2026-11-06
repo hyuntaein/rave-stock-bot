@@ -7,7 +7,10 @@
       현재가가 [매수 범위] 안에 오면 예산만큼 지정가 매수
       금액/매수 범위를 바꾸거나 '같은 조건으로 다시 매매'를 누르면 새 주문으로 인식
   · 보유 묶음 (봇이 산 주식)            : 체결될 때마다 묶음이 생기고, 묶음마다 매도가·손절가를 따로 가짐
-      [매도가] 이상 → 묶음 전량 지정가 매도 / [손절가] 이하 → 묶음 전량 시장가 매도
+      [매도가] 이상 → 묶음 전량 지정가 매도
+      [손절 범위] 안 → 묶음 전량 매도 (범위 시작가 아래로는 안 팔리는 지정가)
+      가격이 범위를 건너뛰고 아래로 지나가면(프리마켓 갭 등) 그 조건은 끝 → 웹앱에서 다시 설정
+        (매수 범위 → 그 매수 주문 종료 / 손절 범위 → 그 묶음의 손절 꺼짐, 익절은 유지)
       웹앱 '조건 해제'(config.yaml 의 released_lots) → 봇이 더 이상 팔지 않음 (주식은 계좌에 그대로)
   · 봇이 사지 않은 주식(원래 갖고 있던 주식)은 절대 건드리지 않음
 
@@ -224,11 +227,14 @@ def load_config():
                 "buy_min": int(s["buy_min"]), "buy_max": int(s["buy_max"]),
                 "sell_min": int(s["sell_min"]),
                 "stop_loss": int(s["stop_loss"]),
+                "stop_min": int(s["stop_min"]) if s.get("stop_min") else None,
                 "round": int(s.get("round", 0) or 0),
             }
         except (KeyError, ValueError, TypeError) as e:
             errors.append(f"{name}: 값이 빠졌거나 숫자가 아님 ({e})")
             continue
+        if item["stop_min"] is not None and not item["stop_min"] < item["stop_loss"]:
+            errors.append(f"{name}: 손절 범위 시작이 손절 범위 끝보다 낮아야 합니다")
         if not (item["stop_loss"] < item["buy_min"] <= item["buy_max"] < item["sell_min"]):
             errors.append(f"{name}: 손절가 < 매수하한 ≤ 매수상한 < 매도하한 순서여야 합니다")
         if item["budget"] > max_budget:
@@ -250,8 +256,22 @@ def load_config():
         "start": st.get("trade_start", "09:00"),
         "end": st.get("trade_end", "15:19"),
         "released": {str(x) for x in (cfg.get("released_lots") or [])},
+        "overrides": _read_overrides(cfg.get("lot_overrides")),
     }
     return settings, stocks
+
+
+def _read_overrides(raw):
+    out = {}
+    for lid, v in (raw or {}).items():
+        try:
+            o = {"sell_min": int(v["sell_min"]), "stop_loss": int(v["stop_loss"]),
+                 "stop_min": int(v["stop_min"]) if v.get("stop_min") else None}
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (o["stop_min"] is None or o["stop_min"] < o["stop_loss"]) and o["stop_loss"] < o["sell_min"]:
+            out[str(lid)] = o
+    return out
 
 
 # ─────────────────────────── 상태 저장 ───────────────────────────
@@ -450,6 +470,10 @@ def record_trade(row):
         w.writerow(row)
 
 
+def stop_text(l):
+    return f"{won(l['stop_min'])}~{won(l['stop_loss'])}" if l.get("stop_min") else f"{won(l['stop_loss'])}↓"
+
+
 # ─────────────────────────── 봇 ───────────────────────────
 def new_ticket(run=1):
     return {"done": False, "paused": False, "reject_count": 0, "open_order": None, "bought": 0,
@@ -516,6 +540,7 @@ class Bot:
                     "id": lid, "symbol": sym, "name": card["name"] if card else sym, "ticket": tid, "run": 0,
                     "qty": held, "cost": avg * held,
                     "sell_min": card["sell_min"] if card else None, "stop_loss": card["stop_loss"] if card else None,
+                    "stop_min": card["stop_min"] if card else None,
                     "opened_at": st.get("last_fill_at") or datetime.now(KST).isoformat(timespec="seconds"),
                     "open_order": oo if (oo and oo.get("side") == "SELL") else None,
                     "no_take_profit": bool(st.get("no_take_profit")), "reject_count": 0, "sim": False, "pnl": 0,
@@ -573,7 +598,7 @@ class Bot:
         if not self.dry:
             lines = [f"· 주문 {s['name']} {won(s['buy_min'])}~{won(s['buy_max'])} 매수" for s in self.stocks
                      if not self.tickets.get(s["id"], {}).get("done")]
-            lines += [f"· 보유 {l['name']} {l['qty']}주 / {won(l['sell_min'])}↑ 매도 / {won(l['stop_loss'])}↓ 손절"
+            lines += [f"· 보유 {l['name']} {l['qty']}주 / {won(l['sell_min'])}↑ 매도 / {stop_text(l)} 손절"
                       for l in self.lots.values()]
             notify("▶️ 자동매매 봇이 시작됐어요 (실전 모드).\n" + "\n".join(lines))
         self.api.account_seq()
@@ -660,12 +685,26 @@ class Bot:
             t["cfg_sig"] = sig
             # 이번 회차에 산 묶음은 카드의 매도가·손절가를 따라감 (예전 묶음은 그대로)
             for lot in self.lots.values():
-                if lot["ticket"] == s["id"] and lot.get("run") == t["run"]:
-                    if (lot["sell_min"], lot["stop_loss"], lot["name"]) != (s["sell_min"], s["stop_loss"], s["name"]):
-                        lot["sell_min"], lot["stop_loss"], lot["name"] = s["sell_min"], s["stop_loss"], s["name"]
-                        lot["no_take_profit"] = False
-                        changed = True
+                if lot["ticket"] == s["id"] and lot.get("run") == t["run"] and lot["id"] not in self.settings["overrides"]:
+                    changed |= self.set_lot_conditions(lot, s["sell_min"], s["stop_min"], s["stop_loss"], s["name"])
+        # 웹앱 '조건 수정'으로 직접 바꾼 묶음
+        for lid, o in self.settings["overrides"].items():
+            if lid in self.lots:
+                changed |= self.set_lot_conditions(self.lots[lid], o["sell_min"], o["stop_min"], o["stop_loss"])
         return changed
+
+    def set_lot_conditions(self, lot, sell_min, stop_min, stop_loss, name=None):
+        new = (sell_min, stop_min, stop_loss, name or lot["name"])
+        if (lot["sell_min"], lot.get("stop_min"), lot["stop_loss"], lot["name"]) == new:
+            return False
+        lot["sell_min"], lot["stop_min"], lot["stop_loss"], lot["name"] = new
+        lot["no_take_profit"] = False
+        if lot.get("stop_expired"):
+            lot["stop_expired"] = False
+            notify(f"🔁 [{lot['name']}] 손절 조건을 다시 켰어요: {stop_text(lot)}", kakao=False)
+        lot["stop_zone"] = None
+        log.info(f"[{lot['name']}] ⚙️  묶음 조건 변경 → 매도 {won(sell_min)} / 손절 {stop_text(lot)}")
+        return True
 
     def cancel_orphan_buys(self):
         """웹앱에서 끄거나 지운 주문 카드에 걸려 있던 매수 주문 취소"""
@@ -753,7 +792,16 @@ class Bot:
         if remain <= 0:
             t["done"] = True
             return
-        if s["buy_min"] <= price <= s["buy_max"]:
+        zone = "above" if price > s["buy_max"] else ("below" if price < s["buy_min"] else "in")
+        last, t["last_zone"] = t.get("last_zone"), zone
+        if zone == "below" and last in ("above", "in"):
+            t["done"], t["expired"] = True, True
+            log.warning(f"[{s['name']}] 🚫 가격이 매수 범위를 지나 {won(price)}로 내려감 → 이 매수 주문 종료")
+            notify(f"🚫 [{s['name']}] 가격이 매수 범위({won(s['buy_min'])}~{won(s['buy_max'])})를 지나쳐 "
+                   f"{won(price)}까지 내려갔어요.\n이 매수 주문은 끝냈어요. 사려면 웹앱에서 범위를 다시 설정하세요.",
+                   kakao=not self.dry)
+            return
+        if zone == "in":
             log.info(f"[{s['name']}] 🛒 매수 구간 진입 — 현재가 {won(price)} → {remain}주 {won(s['buy_price'])} 이하 지정가 매수")
             oid = "SIM-" + uuid.uuid4().hex[:12] if self.dry else \
                 self.api.place_order(s["symbol"], "BUY", remain, "LIMIT", s["buy_price"])
@@ -821,7 +869,7 @@ class Bot:
         if not lot:
             lot = self.lots[lid] = {
                 "id": lid, "symbol": s["symbol"], "name": s["name"], "ticket": s["id"], "run": t["run"],
-                "qty": 0, "cost": 0, "sell_min": s["sell_min"], "stop_loss": s["stop_loss"],
+                "qty": 0, "cost": 0, "sell_min": s["sell_min"], "stop_loss": s["stop_loss"], "stop_min": s["stop_min"],
                 "opened_at": now.isoformat(timespec="seconds"), "open_order": None,
                 "no_take_profit": False, "reject_count": 0, "sim": self.dry, "pnl": 0}
         lot["qty"] += filled
@@ -830,7 +878,7 @@ class Bot:
         self.recent_fill[s["symbol"]] = time.time()
         log.info(f"[{s['name']}] ✔ 매수 체결 {filled}주 @ {won(avg)} → 보유 묶음 {lot['qty']}주")
         notify(f"🛒 [{s['name']}] 매수 체결\n{filled}주 × {won(avg)} = {won(filled * avg)}\n"
-               f"이 묶음 {lot['qty']}주 · {won(lot['sell_min'])}↑ 매도 / {won(lot['stop_loss'])}↓ 손절", kakao=not self.dry)
+               f"이 묶음 {lot['qty']}주 · {won(lot['sell_min'])}↑ 매도 / {stop_text(lot)} 손절", kakao=not self.dry)
         record_trade([datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S"), s["name"], s["symbol"], "매수", "구간매수",
                       filled, avg, filled * avg, "모의" if self.dry else "실전"])
 
@@ -858,13 +906,29 @@ class Bot:
             return
         stop_hit = price <= lot["stop_loss"]
         take_hit = price >= lot["sell_min"] and not lot.get("no_take_profit")
+        floor = lot.get("stop_min")
+        if floor:
+            zone = "above" if price > lot["stop_loss"] else ("below" if price < floor else "in")
+            last, lot["stop_zone"] = lot.get("stop_zone"), zone
+            if zone == "below" and last in ("above", "in") and not lot.get("stop_expired"):
+                lot["stop_expired"] = True
+                log.warning(f"[{lot['name']}] 🚫 가격이 손절 범위를 지나 {won(price)}로 내려감 → 손절 조건 꺼짐")
+                notify(f"🚫 [{lot['name']}] 가격이 손절 범위({won(floor)}~{won(lot['stop_loss'])})를 지나쳐 "
+                       f"{won(price)}까지 내려갔어요.\n이 묶음({lot['qty']}주)의 손절 조건은 껐어요. 봇은 팔지 않아요.\n"
+                       f"웹앱 현황 → 이 묶음 '조건 수정'에서 손절 범위를 다시 설정하세요.",
+                       kakao=not (self.dry or lot.get("sim")))
+            if lot.get("stop_expired") or zone == "below":
+                stop_hit = False
         if not (stop_hit or take_hit):
             return
         qty = lot["qty"] if (self.dry or lot.get("sim")) else min(lot["qty"], self.api.sellable(lot["symbol"]))
         if qty <= 0:
             self.notice_once(f"[{lot['name']}] 매도 조건이지만 매도 가능 수량이 0주 (앱에 매도 주문이 걸려 있는지 확인)")
             return
-        if stop_hit:
+        if stop_hit and floor:
+            otype, px, reason = "LIMIT", tick_up(floor), "손절"
+            log.warning(f"[{lot['name']}] 🔻 손절 범위 진입 — 현재가 {won(price)} → {qty}주 {won(px)} 이상 지정가 매도")
+        elif stop_hit:
             otype, px, reason = "MARKET", None, "손절"
             log.warning(f"[{lot['name']}] 🔻 손절 조건 — 현재가 {won(price)} ≤ {won(lot['stop_loss'])} → {qty}주 시장가 매도")
         else:
@@ -874,7 +938,8 @@ class Bot:
         oid = "SIM-" + uuid.uuid4().hex[:12] if sim else self.api.place_order(lot["symbol"], "SELL", qty, otype, px)
         lot["open_order"] = {"id": oid, "side": "SELL", "type": otype, "qty": qty, "price": px, "reason": reason,
                              "placed_at": now.isoformat(), "cancel_requested": False}
-        notify(f"📝 [{lot['name']}] {reason} 매도 주문 접수\n{qty}주 · {'시장가' if px is None else won(px) + ' 지정가'}"
+        how = "시장가" if px is None else (f"{won(px)} 이상에만 파는 지정가" if reason == "손절" else won(px) + " 지정가")
+        notify(f"📝 [{lot['name']}] {reason} 매도 주문 접수\n{qty}주 · {how}"
                + ("" if sim else "\n취소하려면 토스 앱 → 주문내역 → 대기에서 취소하세요."), kakao=not sim)
 
     def check_sell(self, lot, price, now):
@@ -916,10 +981,12 @@ class Bot:
             return
         age = (now - datetime.fromisoformat(o["placed_at"])).total_seconds()
         why = None
-        if price <= lot["stop_loss"] and o["type"] == "LIMIT":
+        if o["reason"] == "익절" and price <= lot["stop_loss"]:
             why = "손절가 도달 — 손절 우선"
-        elif age > self.settings["order_timeout"] and o["type"] == "LIMIT" and price < lot["sell_min"]:
+        elif o["reason"] == "익절" and age > self.settings["order_timeout"] and price < lot["sell_min"]:
             why = "가격이 매도가 아래로 내려감"
+        elif o["reason"] == "손절" and o["type"] == "LIMIT" and age > self.settings["order_timeout"]:
+            why = "손절 주문이 시간 안에 안 팔림 — 다시 판단"
         if why:
             log.info(f"[{lot['name']}] 매도 주문 취소 요청 ({why})")
             notify(f"↩️ [{lot['name']}] 봇이 매도 주문 취소 요청 ({why})", kakao=False)
@@ -957,6 +1024,8 @@ class Bot:
                 label = "일시정지"
             elif t.get("manual_buy_stop"):
                 label = "매수 중단 (앱에서 취소)"
+            elif t.get("expired"):
+                label = "범위 지나감 — 다시 설정 필요"
             elif t["done"]:
                 label = "매수 완료"
             elif t["open_order"]:
@@ -976,10 +1045,14 @@ class Bot:
                 notes.append("앱에서 매도 취소 → 익절 멈춤 (손절은 감시 중)")
             if l.get("sim"):
                 notes.append("모의 매매 묶음")
+            if l.get("stop_expired"):
+                notes.append("🚫 손절 범위를 지나쳐서 손절이 꺼졌어요 — '조건 수정'으로 다시 설정하세요")
             lots.append({"id": l["id"], "name": l["name"], "symbol": l["symbol"], "qty": l["qty"],
                          "avg": int(l["cost"] / l["qty"]) if l["qty"] else None,
                          "price": self.last_prices.get(l["symbol"]), "sell_min": l["sell_min"],
-                         "stop_loss": l["stop_loss"], "opened_at": l["opened_at"], "pnl": l.get("pnl", 0),
+                         "stop_loss": l["stop_loss"], "stop_min": l.get("stop_min"),
+                         "stop_expired": bool(l.get("stop_expired")),
+                         "opened_at": l["opened_at"], "pnl": l.get("pnl", 0),
                          "order": order_view(l.get("open_order")), "notes": notes})
         return {"updated_at": now.isoformat(timespec="seconds"), "market_open": market,
                 "mode": "모의" if self.dry else "실전", "started_at": self.started_at,
@@ -1053,7 +1126,7 @@ def main():
             flag = "완료" if t["done"] else "일시정지" if t["paused"] else "진행중"
             print(f"주문 {tid}: {flag} | 산 수량 {t['bought']}주 | 대기 주문 {'있음' if t['open_order'] else '없음'}")
         for lid, l in st["lots"].items():
-            print(f"묶음 {lid}: {l['name']} {l['qty']}주 | 매도 {l['sell_min']} / 손절 {l['stop_loss']}")
+            print(f"묶음 {lid}: {l['name']} {l['qty']}주 | 매도 {l['sell_min']} / 손절 {l.get('stop_min')}~{l['stop_loss']}")
         print(f"누적 실현손익 {st.get('pnl', 0):+,}원")
         return
     try:

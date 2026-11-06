@@ -251,11 +251,12 @@ function normalize(){
     max_budget_per_stock: 10000000, trade_start: "09:00", trade_end: "15:19",
   }, cfg.settings || {});
   cfg.released_lots = (cfg.released_lots || []).map(String);
+  cfg.lot_overrides = cfg.lot_overrides || {};
   cfg.stocks = (cfg.stocks || []).map((s, i) => ({
     id: String(s.id || `${String(s.symbol ?? "").padStart(6, "0").slice(-6)}#${i}`),
     name: s.name ?? "", symbol: String(s.symbol ?? "").padStart(6, "0").slice(-6),
     enabled: s.enabled !== false, budget: digits(s.budget), buy_min: digits(s.buy_min), buy_max: digits(s.buy_max),
-    sell_min: digits(s.sell_min), stop_loss: digits(s.stop_loss),
+    sell_min: digits(s.sell_min), stop_loss: digits(s.stop_loss), stop_min: digits(s.stop_min),
     round: digits(s.round) || 0,
   }));
 }
@@ -291,13 +292,16 @@ function toYaml(){
       `    buy_min: ${k.buy_min ?? 0}            # 매수 범위 시작`,
       `    buy_max: ${k.buy_max ?? 0}            # 매수 범위 끝`,
       `    sell_min: ${k.sell_min ?? 0}           # 이 주문으로 산 묶음: 이 가격 이상이면 전량 매도`,
-      `    stop_loss: ${k.stop_loss ?? 0}          # 이 주문으로 산 묶음: 이 가격 이하면 전량 손절`,
+      `    stop_loss: ${k.stop_loss ?? 0}          # 손절 범위 끝: 이 가격 이하로 내려오면 손절 시작`,
+      `    stop_min: ${k.stop_min ?? 0}           # 손절 범위 시작: 이보다 더 아래(갭 하락)면 팔지 않고 대기`,
       `    round: ${k.round || 0}                  # 숫자가 바뀌면 같은 조건으로 새 주문`,
       ""
     );
   }
   L.push("# 웹앱에서 '조건 해제'한 보유 묶음 (봇이 더 이상 팔지 않음)",
-         "released_lots: " + JSON.stringify(cfg.released_lots || []), "");
+         "released_lots: " + JSON.stringify(cfg.released_lots || []), "",
+         "# 웹앱 '조건 수정'으로 바꾼 보유 묶음의 매도가·손절 범위",
+         "lot_overrides: " + JSON.stringify(cfg.lot_overrides || {}), "");
   return L.join("\n");
 }
 
@@ -307,10 +311,11 @@ function check(k){
   const max = cfg.settings.max_budget_per_stock;
   if (!String(k.name).trim()) e.push("이름을 넣어주세요.");
   if (!/^\d{6}$/.test(k.symbol)) e.push("종목코드는 숫자 6자리예요. (예: 삼성전자 005930)");
-  for (const [key, label] of [["budget","예산"],["buy_min","매수 시작가"],["buy_max","매수 끝가"],["sell_min","매도가"],["stop_loss","손절가"]])
+  for (const [key, label] of [["budget","예산"],["buy_min","매수 시작가"],["buy_max","매수 끝가"],["sell_min","매도가"],["stop_min","손절 범위 시작"],["stop_loss","손절 범위 끝"]])
     if (!k[key]) e.push(`${label}을(를) 넣어주세요.`);
   if (e.length) return e;
-  if (!(k.stop_loss < k.buy_min)) e.push("손절가는 매수 시작가보다 낮아야 해요.");
+  if (!(k.stop_min < k.stop_loss)) e.push("손절 범위 시작이 손절 범위 끝보다 낮아야 해요.");
+  if (!(k.stop_loss < k.buy_min)) e.push("손절 범위 끝은 매수 시작가보다 낮아야 해요.");
   if (!(k.buy_min <= k.buy_max)) e.push("매수 시작가가 끝가보다 클 수 없어요.");
   if (!(k.buy_max < k.sell_min)) e.push("매도가는 매수 끝가보다 높아야 해요.");
   if (k.budget > max) e.push(`예산이 안전 한도(${fmt(max)}원)보다 커요. 아래 '안전 설정'에서 한도를 올릴 수 있어요.`);
@@ -344,10 +349,13 @@ function render(){
         <div><label class="f">매수 범위 시작</label><input type="text" inputmode="numeric" data-k="buy_min" placeholder="210,000"></div>
         <div><label class="f">매수 범위 끝</label><input type="text" inputmode="numeric" data-k="buy_max" placeholder="212,000"></div>
       </div>
+      <label class="f">🎯 매도가 (이 가격 이상이면 전량 매도)</label>
+      <input type="text" inputmode="numeric" data-k="sell_min" placeholder="230,000">
       <div class="grid2">
-        <div><label class="f">🎯 매도가 (이상이면 전량)</label><input type="text" inputmode="numeric" data-k="sell_min" placeholder="220,000"></div>
-        <div><label class="f">🔻 손절가 (이하면 전량)</label><input type="text" inputmode="numeric" data-k="stop_loss" placeholder="190,000"></div>
+        <div><label class="f">🔻 손절 범위 시작</label><input type="text" inputmode="numeric" data-k="stop_min" placeholder="180,000"></div>
+        <div><label class="f">🔻 손절 범위 끝</label><input type="text" inputmode="numeric" data-k="stop_loss" placeholder="190,000"></div>
       </div>
+      <div class="muted" style="margin-top:6px;line-height:1.5">범위 안에서만 사고 손절해요. 프리마켓 갭처럼 가격이 범위를 건너뛰고 아래로 지나가면 그 조건은 끝나요 → 카톡 알림 후 다시 설정하세요.</div>
       <div class="summary" data-sum></div>
       <div class="err" data-err></div>
       <div class="muted" style="margin-top:10px;line-height:1.5">💡 체결된 뒤 금액이나 매수 범위를 바꾸면 <b>새 주문</b>으로 인식해서 따로 사요. 먼저 산 묶음은 그 조건 그대로예요.</div>
@@ -359,7 +367,7 @@ function render(){
     inp("name").value = k.name;
     inp("symbol").value = k.symbol;
     inp("enabled").checked = k.enabled;
-    for (const key of ["budget","buy_min","buy_max","sell_min","stop_loss"]) inp(key).value = fmt(k[key]);
+    for (const key of ["budget","buy_min","buy_max","sell_min","stop_min","stop_loss"]) inp(key).value = fmt(k[key]);
 
     c.addEventListener("input", (ev) => {
       const key = ev.target.dataset.k; if (!key) return;
@@ -401,7 +409,8 @@ function update(card, k){
     const pct = (a, b) => ((a / b - 1) * 100).toFixed(1);
     sum.innerHTML = `${fmt(k.buy_min)}~${fmt(k.buy_max)}원 사이면 <b>${qty}주</b> 매수 (약 ${fmt(qty * bp)}원)<br>`
       + `${fmt(k.sell_min)}원 이상이면 전량 매도 <span class="muted">(+${pct(k.sell_min, k.buy_max)}%)</span><br>`
-      + `${fmt(k.stop_loss)}원 이하면 전량 손절 <span class="muted">(${pct(k.stop_loss, k.buy_max)}%)</span>`;
+      + `${fmt(k.stop_min)}~${fmt(k.stop_loss)}원이면 전량 손절 <span class="muted">(${pct(k.stop_loss, k.buy_max)}% ~ ${pct(k.stop_min, k.buy_max)}%)</span><br>`
+      + `<span class="muted">범위를 건너뛰고 지나가면 그 조건은 끝 (다시 설정 필요)</span>`;
     sum.style.display = "";
   } else sum.style.display = "none";
   refreshSave();
@@ -444,12 +453,31 @@ function kstMarketOpen(){
   const m = k.getHours() * 60 + k.getMinutes(), d = k.getDay();
   return d >= 1 && d <= 5 && m >= 540 && m < 920;
 }
-let stTimer = null, lastStatus = null;
+let stTimer = null, lastStatus = null, editingLot = false;
+async function saveLot(id){
+  const box = $("stRows").querySelector(`[data-editbox="${CSS.escape(id)}"]`);
+  const g = (k) => digits(box.querySelector(`[data-ek="${k}"]`).value);
+  const o = { sell_min: g("sell_min"), stop_min: g("stop_min"), stop_loss: g("stop_loss") };
+  const e = [];
+  if (!o.sell_min || !o.stop_min || !o.stop_loss) e.push("세 칸을 모두 넣어주세요.");
+  else {
+    if (!(o.stop_min < o.stop_loss)) e.push("손절 범위 시작이 끝보다 낮아야 해요.");
+    if (!(o.stop_loss < o.sell_min)) e.push("손절 범위 끝이 매도가보다 낮아야 해요.");
+  }
+  box.querySelector("[data-eerr]").innerHTML = e.map(x => "• " + x).join("<br>");
+  if (e.length) return;
+  if (cfg.stocks.some(k => check(k).length)){ alert("아래 주문 카드에 빨간 글씨(입력 오류)가 있어서 저장할 수 없어요. 먼저 고쳐주세요."); return; }
+  cfg.lot_overrides[id] = o;
+  editingLot = false;
+  await save();
+  toast("✅ 묶음 조건을 저장했어요. 1분 안에 반영되고, 꺼진 손절도 다시 켜져요.", "ok");
+  loadStatus();
+}
 function paintTicket(card, tid){
   const box = card.querySelector("[data-tstat]"); if (!box) return;
   const t = lastStatus && (lastStatus.tickets || []).find(x => x.id === tid);
   if (!t){ box.innerHTML = ""; return; }
-  const cls = t.label.includes("대기 중") ? "wait" : t.label.includes("완료") ? "done" : t.label.includes("중단") || t.label.includes("정지") ? "stop" : "hold";
+  const cls = t.label.includes("대기 중") ? "wait" : t.label.includes("완료") ? "done" : (t.label.includes("중단") || t.label.includes("정지") || t.label.includes("지나감")) ? "stop" : "hold";
   box.innerHTML = `<span class="pill ${cls}">${esc(t.label)}</span> <span class="muted">현재가 ${t.price ? fmt(t.price) + "원" : "-"} · 산 수량 ${t.bought}/${t.target}주</span>`;
 }
 async function releaseLot(id, name, qty){
@@ -485,13 +513,27 @@ async function loadStatus(){
     let h = `<div class="srow"><div class="row"><div><span class="sname">${esc(x.name)}</span> <span class="muted">${x.qty}주</span></div>
       <div class="sprice">${x.price ? fmt(x.price) + "원" : "-"}</div></div>
       <div class="kv"><span>평균 매수가</span><b>${fmt(x.avg)}원${pl !== null ? ` <span style="color:${pl >= 0 ? "var(--red)" : "var(--blue)"}">(${pl >= 0 ? "+" : ""}${pl.toFixed(1)}%)</span>` : ""}</b></div>
-      <div class="kv"><span>🎯 매도 / 🔻 손절</span><b>${fmt(x.sell_min)}원↑ / ${fmt(x.stop_loss)}원↓</b></div>
+      <div class="kv"><span>🎯 매도</span><b>${fmt(x.sell_min)}원 이상</b></div>
+      <div class="kv"><span>🔻 손절</span><b>${x.stop_min ? fmt(x.stop_min) + "~" + fmt(x.stop_loss) + "원" : fmt(x.stop_loss) + "원 이하"}</b></div>
       <div class="kv"><span>산 날짜</span><b>${hm(x.opened_at)}</b></div>`;
     h += orderBox(x.order);
     for (const n of x.notes || []) h += `<div class="muted" style="margin-top:8px">ℹ️ ${esc(n)}</div>`;
     const rel = (cfg.released_lots || []).includes(x.id);
-    h += rel ? `<div class="muted" style="margin-top:10px">🔓 조건 해제 요청됨 — 1분 안에 반영돼요</div>`
-             : `<button class="btn plain" style="margin-top:10px" data-release="${esc(x.id)}" data-qty="${x.qty}" data-name="${esc(x.name)}">조건 해제 (봇이 안 팔게)</button>`;
+    if (rel) return h + `<div class="muted" style="margin-top:10px">🔓 조건 해제 요청됨 — 1분 안에 반영돼요</div></div>`;
+    const ov = (cfg.lot_overrides || {})[x.id] || {};
+    const v = (k) => fmt(ov[k] ?? x[k]);
+    h += `<div class="actions">
+        <button class="btn ${x.stop_expired ? "primary" : "plain"}" style="font-size:14px;padding:10px 14px" data-edit="${esc(x.id)}">조건 수정</button>
+        <button class="btn plain" data-release="${esc(x.id)}" data-qty="${x.qty}" data-name="${esc(x.name)}">조건 해제 (봇이 안 팔게)</button></div>
+      <div class="hidden" data-editbox="${esc(x.id)}" style="margin-top:6px">
+        <label class="f">🎯 매도가 (이상이면 전량)</label><input type="text" inputmode="numeric" data-ek="sell_min" value="${v("sell_min")}">
+        <div class="grid2">
+          <div><label class="f">🔻 손절 범위 시작</label><input type="text" inputmode="numeric" data-ek="stop_min" value="${v("stop_min")}" placeholder="예: 180,000"></div>
+          <div><label class="f">🔻 손절 범위 끝</label><input type="text" inputmode="numeric" data-ek="stop_loss" value="${v("stop_loss")}"></div>
+        </div>
+        <div class="err" data-eerr></div>
+        <button class="btn primary full" style="margin-top:10px" data-esave="${esc(x.id)}">이 묶음 조건 저장</button>
+      </div>`;
     return h + "</div>";
   }).join("") || `<div class="muted" style="margin-top:6px">봇이 산 주식이 없어요.</div>`;
   const tks = (st.tickets || []).filter(x => x.order);
@@ -501,13 +543,21 @@ async function loadStatus(){
   }
   $("stRows").innerHTML = html;
   $("stRows").querySelectorAll("[data-release]").forEach(btn => btn.onclick = () => releaseLot(btn.dataset.release, btn.dataset.name, btn.dataset.qty));
+  $("stRows").querySelectorAll("[data-edit]").forEach(btn => btn.onclick = () => {
+    const box = $("stRows").querySelector(`[data-editbox="${CSS.escape(btn.dataset.edit)}"]`);
+    box.classList.toggle("hidden"); editingLot = !box.classList.contains("hidden");
+  });
+  $("stRows").querySelectorAll("[data-editbox] input").forEach(inp => inp.addEventListener("input", () => {
+    const n = digits(inp.value); inp.value = fmt(n);
+  }));
+  $("stRows").querySelectorAll("[data-esave]").forEach(btn => btn.onclick = () => saveLot(btn.dataset.esave));
   document.querySelectorAll("#stocks .card").forEach(c => paintTicket(c, c.dataset.tid));
   const evs = (st.events || []).slice().reverse();
   const row = (e) => `<div class="ev"><time>${hm(e.t)}</time><div>${esc(e.text)}</div></div>`;
   $("evList").innerHTML = !evs.length ? `<div class="muted">아직 기록이 없어요.</div>`
     : evs.slice(0, 6).map(row).join("") + (evs.length > 6 ? `<details><summary class="muted" style="font-weight:500;font-size:14px;padding:10px 0">이전 기록 ${evs.length - 6}개 더 보기</summary>${evs.slice(6).map(row).join("")}</details>` : "");
 }
-function startStatus(){ loadStatus(); clearInterval(stTimer); stTimer = setInterval(() => { if (!document.hidden) loadStatus(); }, 30000); }
+function startStatus(){ loadStatus(); clearInterval(stTimer); stTimer = setInterval(() => { if (!document.hidden && !editingLot) loadStatus(); }, 30000); }
 document.addEventListener("visibilitychange", () => { if (!document.hidden && token && !$("main").classList.contains("hidden")) loadStatus(); });
 
 /* ---------- 이벤트 ---------- */
@@ -523,7 +573,7 @@ $("mLive").onclick = () => {
   cfg.settings.dry_run = false; render();
 };
 $("addBtn").onclick = () => {
-  cfg.stocks.push({ id: "t" + Date.now().toString(36), name:"", symbol:"", enabled:true, budget:null, buy_min:null, buy_max:null, sell_min:null, stop_loss:null, round:0 });
+  cfg.stocks.push({ id: "t" + Date.now().toString(36), name:"", symbol:"", enabled:true, budget:null, buy_min:null, buy_max:null, sell_min:null, stop_min:null, stop_loss:null, round:0 });
   render(); window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
 };
 $("maxBudget").addEventListener("input", (ev) => {
