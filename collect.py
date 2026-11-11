@@ -8,7 +8,7 @@
   python collect.py --status    진행 상황
 
 · 토스증권 Open API 1분봉(KRX+NXT 통합 시세)을 씀 — 자동매매와 다른 호출 한도라 매매에 영향 없음
-· 1단계: 2025-03-04(넥스트레이드 프리마켓 시작) ~ 어제  /  2단계: 2022-11-23 ~ 2025-03-03 (9:00·9:30만 있음)
+· 기간: 2025-03-04(넥스트레이드 프리마켓 시작) ~ 어제
 · 결과: data/premarket.db (SQLite) → 단계가 끝날 때마다 rave-stock-data 저장소 research/ 에 CSV(gzip) 업로드
 · 진행 상황은 카톡으로 (시작, 25%마다, 끝)
 """
@@ -128,6 +128,10 @@ def list_symbols(api, verbose=False):
             if not sym or not sym.isdigit() or len(sym) != 6 or sym in seen:
                 continue
             seen.add(sym)
+            if "securityType" in it and str(it["securityType"]).upper() != "STOCK":
+                continue                      # ETF·ETN 등 제외
+            if it.get("isCommonShare") is False:
+                continue                      # 우선주 제외
             name = next((str(it[k]) for k in ("name", "stockName", "koreanName", "nameKr", "shortName") if it.get(k)), "")
             kind = " ".join(str(it.get(k, "")) for k in ("market", "marketType", "securityType", "type", "category", "exchange"))
             out.append({"symbol": sym, "name": name, "kind": kind.strip()})
@@ -189,16 +193,17 @@ def day_points(api, symbol, d):
         return None
     bars.sort()
 
-    def first_open(lo, hi):          # lo 이상 hi 미만 첫 봉의 시가
+    # 토스는 거래가 없는 시간에도 거래량 0인 빈 봉을 채워 줌 → 실제 거래가 있던 봉만 사용
+    def first_open(lo, hi):          # lo 이상 hi 미만, 거래 있던 첫 봉의 시가
         for h, m, o, c, v in bars:
-            if lo <= (h, m) < hi:
+            if lo <= (h, m) < hi and v > 0:
                 return o
         return None
 
-    def last_close(lo, upto):        # lo 이상 upto 이하 마지막 봉의 종가
+    def last_close(lo, upto):        # lo 이상 upto 이하, 거래 있던 마지막 봉의 종가
         r = None
         for h, m, o, c, v in bars:
-            if lo <= (h, m) <= upto:
+            if lo <= (h, m) <= upto and v > 0:
                 r = c
         return r
 
@@ -268,7 +273,7 @@ def run_phase(api, c, phase, syms):
     cal = trading_days(api, lo, hi)
     todo = [s for s in syms if not c.execute("SELECT 1 FROM done WHERE symbol=? AND phase=?", (s["symbol"], phase)).fetchone()]
     total, start_n = len(syms), len(syms) - len(todo)
-    label = "1단계(2025.3~, 프리마켓 있음)" if phase == 1 else "2단계(2022.11~2025.2, 9시·9시반만)"
+    label = "(2025.3.4~어제)" if phase == 1 else "(2022.11~2025.2)"
     log.info(f"phase {phase}: {len(cal)} trading days, {len(todo)}/{total} symbols left")
     kakao(f"📥 프리마켓 데이터 수집 {label} 시작\n종목 {total}개 중 {len(todo)}개 남음 · 거래일 {len(cal)}일\n"
           f"예상 {len(todo) * len(cal) / RATE / 3600:.0f}시간 정도 걸려요.")
@@ -333,7 +338,7 @@ def main():
     c = db()
     if args[:1] == ["--status"]:
         n = c.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
-        for ph in (1, 2):
+        for ph in (1,):
             d = c.execute("SELECT COUNT(*) FROM done WHERE phase=?", (ph,)).fetchone()[0]
             print(f"phase {ph}: {d}/{n} symbols done")
         print("rows:", c.execute("SELECT COUNT(*) FROM days").fetchone()[0])
@@ -346,8 +351,7 @@ def main():
         c.executemany("INSERT OR REPLACE INTO symbols VALUES(:symbol,:name,:kind)", syms)
         c.commit()
         log.info(f"symbols: {len(syms)}")
-    for phase in (1, 2):
-        run_phase(api, c, phase, syms)
+    run_phase(api, c, 1, syms)   # 프리마켓이 생긴 2025-03-04 이후만 (그 전은 8시대 거래가 없어 의미 없음)
     kakao("🎉 프리마켓 데이터 수집이 모두 끝났어요. 파일을 받아서 보내주시면 확률표로 정리해 드릴게요.")
 
 
