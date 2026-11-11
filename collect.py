@@ -94,20 +94,48 @@ def ts_kst(v):
 
 
 # ─────────────── 종목 목록 ───────────────
-def list_symbols(api):
-    res = api.get("/api/v1/stocks/all")
-    items = res if isinstance(res, list) else next((v for v in (res or {}).values() if isinstance(v, list)), [])
-    out = []
-    for it in items:
-        if not isinstance(it, dict):
+MARKET_TRIES = [["KOSPI", "KOSDAQ"], ["KR"], ["KRX"], ["DOMESTIC"], ["kospi", "kosdaq"], ["kr"]]
+
+
+def _items(res):
+    if isinstance(res, list):
+        return res
+    for v in (res or {}).values():
+        if isinstance(v, list):
+            return v
+    return []
+
+
+def list_symbols(api, verbose=False):
+    """전체 종목 — market 값을 몇 가지 시도해서 되는 걸 씀"""
+    for markets in MARKET_TRIES:
+        items, ok = [], True
+        for m in markets:
+            try:
+                items += _items(api.get("/api/v1/stocks/all", {"market": m}))
+            except ApiError as e:
+                if verbose:
+                    print(f"    market={m}: {e.status} {e.code} {e.data or ''}")
+                ok = False
+                break
+        if not ok or not items:
             continue
-        sym = next((str(it[k]) for k in ("symbol", "code", "stockCode", "shortCode") if it.get(k)), None)
-        if not sym or not sym.isdigit() or len(sym) != 6:
-            continue
-        name = next((str(it[k]) for k in ("name", "stockName", "koreanName", "nameKr", "shortName") if it.get(k)), "")
-        kind = " ".join(str(it.get(k, "")) for k in ("market", "marketType", "securityType", "type", "category", "exchange"))
-        out.append({"symbol": sym, "name": name, "kind": kind.strip()})
-    return out, (items[0] if items else None)
+        out, seen = [], set()
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            sym = next((str(it[k]) for k in ("symbol", "code", "stockCode", "shortCode") if it.get(k)), None)
+            if not sym or not sym.isdigit() or len(sym) != 6 or sym in seen:
+                continue
+            seen.add(sym)
+            name = next((str(it[k]) for k in ("name", "stockName", "koreanName", "nameKr", "shortName") if it.get(k)), "")
+            kind = " ".join(str(it.get(k, "")) for k in ("market", "marketType", "securityType", "type", "category", "exchange"))
+            out.append({"symbol": sym, "name": name, "kind": kind.strip()})
+        if out:
+            if verbose:
+                print(f"    market={markets} -> OK")
+            return out, items[0]
+    return [], None
 
 
 # ─────────────── DB ───────────────
@@ -285,8 +313,9 @@ def main():
     args = sys.argv[1:]
     api = Api()
     if args[:1] == ["--probe"]:
-        syms, sample = list_symbols(api)
-        print(f"[1] stocks/all -> {len(syms)} symbols. first raw item keys: {list(sample.keys()) if isinstance(sample, dict) else sample}")
+        print("[1] stocks/all")
+        syms, sample = list_symbols(api, verbose=True)
+        print(f"    -> {len(syms)} symbols. first raw item keys: {list(sample.keys()) if isinstance(sample, dict) else sample}")
         if syms:
             print(f"    e.g. {syms[0]['symbol']} kind='{syms[0]['kind']}'")
         cs, nb = api.candles("005930", "1d", None, 3)
@@ -312,6 +341,8 @@ def main():
     syms = [{"symbol": r[0], "name": r[1], "kind": r[2]} for r in c.execute("SELECT * FROM symbols")]
     if not syms:
         syms, _ = list_symbols(api)
+        if not syms:
+            sys.exit("종목 목록을 받지 못했어요. --probe 결과를 보여주세요.")
         c.executemany("INSERT OR REPLACE INTO symbols VALUES(:symbol,:name,:kind)", syms)
         c.commit()
         log.info(f"symbols: {len(syms)}")
