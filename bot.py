@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import base64
+import fcntl
 import re
 import sys
 import threading
@@ -49,6 +50,8 @@ CONFIG_FILE = BASE_DIR / "config.yaml"
 STATE_FILE = BASE_DIR / "state.json"
 TRADES_FILE = BASE_DIR / "trades.csv"
 LOG_FILE = BASE_DIR / "bot.log"
+TOKEN_FILE = BASE_DIR / ".toss_token.json"
+TOKEN_LOCK = BASE_DIR / ".toss_token.lock"
 
 FINAL_STATUSES = {"FILLED", "CANCELED", "REJECTED", "REPLACED"}
 ALREADY_DONE_CODES = {"already-filled", "already-canceled", "already-rejected", "already-modified"}
@@ -111,25 +114,39 @@ class Toss:
             sys.exit("❌ .env 파일에 TOSS_CLIENT_ID / TOSS_CLIENT_SECRET 을 넣어주세요.")
         seq = os.environ.get("TOSS_ACCOUNT_SEQ", "").strip()
         self._seq = int(seq) if seq else None
-        self._tok, self._exp = None, 0.0
+        self._tok, self._exp, self._revoked = None, 0.0, None
         self.s = requests.Session()
 
     def token(self) -> str:
+        """토스는 키당 토큰 1개만 유효 → 봇·수집기가 서버 안 파일로 같은 토큰을 공유"""
         if self._tok and time.time() < self._exp - 300:
             return self._tok
-        r = self.s.post(f"{BASE_URL}/oauth2/token", data={
-            "grant_type": "client_credentials",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-        }, timeout=10)
-        if r.status_code == 403:
-            sys.exit("❌ 403: 이 서버의 IP가 토스증권 '허용 IP'에 등록되지 않았습니다.")
-        r.raise_for_status()
-        d = r.json()
-        self._tok = d["access_token"]
-        self._exp = time.time() + int(d.get("expires_in", 3600))
-        log.info("토큰 발급 완료")
-        return self._tok
+        with open(TOKEN_LOCK, "a+") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                d = json.loads(TOKEN_FILE.read_text())
+                if d["exp"] - 300 > time.time() and d["tok"] != self._revoked:
+                    self._tok, self._exp = d["tok"], d["exp"]
+                    return self._tok
+            except Exception:
+                pass
+            r = self.s.post(f"{BASE_URL}/oauth2/token", data={
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            }, timeout=10)
+            if r.status_code == 403:
+                sys.exit("❌ 403: 이 서버의 IP가 토스증권 '허용 IP'에 등록되지 않았습니다.")
+            r.raise_for_status()
+            d = r.json()
+            self._tok = d["access_token"]
+            self._exp = time.time() + int(d.get("expires_in", 3600))
+            tmp = TOKEN_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"tok": self._tok, "exp": self._exp}))
+            os.chmod(tmp, 0o600)
+            tmp.replace(TOKEN_FILE)
+            log.info("토큰 발급 완료 (공유)")
+            return self._tok
 
     def account_seq(self) -> int:
         if self._seq is None:
@@ -160,8 +177,10 @@ class Toss:
                 wait = float(r.headers.get("Retry-After", 1)) + 0.2 * attempt
                 time.sleep(wait)
                 continue
-            if r.status_code == 401 and attempt == 0:
-                self._tok = None
+            if r.status_code == 401 and attempt < 2:
+                # 다른 프로그램이 새 토큰을 받아 이 토큰이 폐기됨 → 공유 파일의 새 토큰으로 다시 시도
+                self._revoked, self._tok = self._tok, None
+                time.sleep(0.5)
                 continue
             if r.status_code >= 400:
                 try:
@@ -253,6 +272,7 @@ def load_config():
         "dry_run": bool(st.get("dry_run", True)),
         "interval": max(2, int(st.get("check_interval_sec", 5))),
         "order_timeout": int(st.get("order_timeout_sec", 60)),
+        "watch": st.get("watch_start", "08:00"),
         "start": st.get("trade_start", "09:00"),
         "end": st.get("trade_end", "15:19"),
         "released": {str(x) for x in (cfg.get("released_lots") or [])},
@@ -584,13 +604,18 @@ class Bot:
             log.info(msg)
             self.last_notice = msg
 
-    def market_open(self, now):
+    def phase(self, now):
+        """closed / watch(프리마켓: 가격 감시·알림만) / trade(주문 가능)"""
         if now.weekday() >= 5:
-            return False
-        if self.closed_until and now < self.closed_until:
-            return False
+            return "closed"
         hm = now.strftime("%H:%M")
-        return self.settings["start"] <= hm < self.settings["end"]
+        if self.settings["watch"] <= hm < self.settings["start"]:
+            return "watch"
+        if self.settings["start"] <= hm < self.settings["end"]:
+            if self.closed_until and now < self.closed_until:
+                return "closed"
+            return "trade"
+        return "closed"
 
     def run(self):
         mode = "🧪 모의 모드 (실제 주문 안 나감)" if self.dry else "🔴 실전 모드 (실제 주문)"
@@ -610,14 +635,15 @@ class Bot:
                     sys.exit(0)   # systemd가 10초 뒤 새 코드로 자동 재시작
                 self.reload_config_if_changed()
                 now = datetime.now(KST)
-                if not self.market_open(now):
+                ph = self.phase(now)
+                if ph == "closed":
                     self.notice_once("장 시간이 아니라 대기 중…")
                     self.housekeeping(now)
                     self.publish(now, market=False)
                     time.sleep(30)
                     continue
-                self.tick(now)
-                self.publish(now, market=True)
+                self.tick(now, watch_only=(ph == "watch"))
+                self.publish(now, market=True, phase=ph)
             except ApiError as e:
                 log.error(f"API 오류: {e}")
             except Exception:
@@ -633,8 +659,9 @@ class Bot:
         if changed:
             save_state(self.state)
 
-    def tick(self, now):
+    def tick(self, now, watch_only=False):
         self.housekeeping(now)
+        self.watch_only = watch_only
         active = [s for s in self.stocks
                   if not self.tickets[s["id"]]["done"] and not self.tickets[s["id"]]["paused"]]
         lots = list(self.lots.values())
@@ -642,10 +669,10 @@ class Bot:
         if not symbols:
             self.notice_once("진행 중인 주문과 보유 묶음이 없습니다")
             return
-        self.notice_once(f"감시 중: 주문 {len(active)}개 · 보유 묶음 {len(lots)}개")
+        self.notice_once(f"{'프리마켓 감시(주문 없음)' if watch_only else '감시 중'}: 주문 {len(active)}개 · 보유 묶음 {len(lots)}개")
         prices = self.api.prices(symbols)
         self.last_prices.update(prices)
-        if not self.dry and any(not l.get("sim") for l in lots):
+        if not self.dry and not watch_only and any(not l.get("sim") for l in lots):
             self.reconcile(self.api.holdings(), now)
         for s in active:
             price = prices.get(s["symbol"])
@@ -785,6 +812,8 @@ class Bot:
 
     # ---------- 매수 (주문 카드) ----------
     def step_ticket(self, s, t, price, now):
+        if t["open_order"] and getattr(self, "watch_only", False):
+            return
         if t["open_order"]:
             self.check_buy(s, t, price, now)
             return
@@ -801,7 +830,7 @@ class Bot:
                    f"{won(price)}까지 내려갔어요.\n이 매수 주문은 끝냈어요. 사려면 웹앱에서 범위를 다시 설정하세요.",
                    kakao=not self.dry)
             return
-        if zone == "in":
+        if zone == "in" and not getattr(self, "watch_only", False):
             log.info(f"[{s['name']}] 🛒 매수 구간 진입 — 현재가 {won(price)} → {remain}주 {won(s['buy_price'])} 이하 지정가 매수")
             oid = "SIM-" + uuid.uuid4().hex[:12] if self.dry else \
                 self.api.place_order(s["symbol"], "BUY", remain, "LIMIT", s["buy_price"])
@@ -896,6 +925,8 @@ class Bot:
 
     # ---------- 매도 (보유 묶음) ----------
     def step_lot(self, lot, price, now):
+        if lot.get("open_order") and getattr(self, "watch_only", False):
+            return
         if lot.get("open_order"):
             self.check_sell(lot, price, now)
             return
@@ -919,6 +950,8 @@ class Bot:
                        kakao=not (self.dry or lot.get("sim")))
             if lot.get("stop_expired") or zone == "below":
                 stop_hit = False
+        if getattr(self, "watch_only", False):
+            return          # 프리마켓: 범위 지나침만 확인하고 주문은 9시부터
         if not (stop_hit or take_hit):
             return
         qty = lot["qty"] if (self.dry or lot.get("sim")) else min(lot["qty"], self.api.sellable(lot["symbol"]))
@@ -1058,12 +1091,13 @@ class Bot:
                 "mode": "모의" if self.dry else "실전", "started_at": self.started_at,
                 "pnl": self.state.get("pnl", 0), "tickets": tickets, "lots": lots, "events": EVENTS[-30:]}
 
-    def publish(self, now, market):
+    def publish(self, now, market, phase=None):
         if not GH_FILE.exists():
             return          # 현황 저장소 연결 전 — 연결되면 바로 올라감
         payload = self.build_status(now, market)
+        payload["phase"] = phase or ("trade" if market else "closed")
         strip = lambda rows: [{k: v for k, v in r.items() if k != "price"} for r in rows]
-        fp = json.dumps([payload["mode"], payload["market_open"], payload["events"][-1:],
+        fp = json.dumps([payload["mode"], payload["phase"], payload["events"][-1:],
                          strip(payload["tickets"]), strip(payload["lots"])], ensure_ascii=False)
         wait = 60 if market else 600
         if fp != self.last_fp or time.time() - self.last_pub >= wait:

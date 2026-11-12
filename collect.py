@@ -36,7 +36,7 @@ DB = DATA / "premarket.db"
 
 NXT_START = date(2025, 3, 4)
 MIN1_START = date(2022, 11, 23)
-RATE = 12            # 초당 호출 수 (차트 한도 20의 60%)
+RATE = 17            # 초당 호출 수 (차트 한도 20 안쪽)
 POINTS = {"p0800": (8, 0), "p0830": (8, 30), "p0900": (9, 0), "p0930": (9, 30)}
 
 log = logging.getLogger("collect")
@@ -62,7 +62,7 @@ class Api:
             try:
                 return self.t._req("GET", path, account=False, params=params)
             except ApiError as e:
-                if e.status in (500, 502, 503, 504) and attempt < 4:
+                if e.status in (401, 500, 502, 503, 504) and attempt < 4:
                     time.sleep(2 + attempt * 3)
                     continue
                 raise
@@ -351,7 +351,17 @@ def main():
         c.executemany("INSERT OR REPLACE INTO symbols VALUES(:symbol,:name,:kind)", syms)
         c.commit()
         log.info(f"symbols: {len(syms)}")
-    run_phase(api, c, 1, syms)   # 프리마켓이 생긴 2025-03-04 이후만 (그 전은 8시대 거래가 없어 의미 없음)
+    for tries in range(8):        # 일시적 오류로 멈추면 5분 쉬고 이어서 (받은 데이터는 건너뜀)
+        try:
+            run_phase(api, c, 1, syms)   # 프리마켓이 생긴 2025-03-04 이후만
+            break
+        except Exception as e:
+            log.info(f"stopped: {e} — retry in 5 min ({tries + 1}/8)")
+            if tries == 7:
+                kakao(f"⚠️ 데이터 수집이 오류로 멈췄어요: {str(e)[:80]}")
+                return
+            time.sleep(300)
+            api = Api()
     kakao("🎉 프리마켓 데이터 수집이 모두 끝났어요. 파일을 받아서 보내주시면 확률표로 정리해 드릴게요.")
 
 
